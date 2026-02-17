@@ -1,14 +1,45 @@
+"""Meshcore Analyzer — анализатор пакетов MeshCore Observer.
+
+Version: 1.1
+
+Changelog:
+  v1.1 — Дешифрование каналов, исходящие соседи
+    - Расшифровка групповых сообщений (GRP_TXT/GRP_DATA) публичных каналов (AES-128-ECB)
+    - Таблица исходящих соседей (-n): кто ретранслирует наши исходящие пакеты
+      (паттерны: "Found N unique path(s):" и сообщения от AetherByte🤖)
+    - В verbose (-v) сообщения с исходящим path выделяются магентой
+    - Столбцы ->RPT/->OBS в таблице входящих соседей вместо бесполезного SNR
+    - Зависимость: pycryptodome (опционально)
+  v1.0 — Первая публикация
+    - Статистика по узлам (-o): RX/TX, SNR, RSSI, хопы
+    - Таблица входящих соседей (-n)
+    - Рекорд хопов (-p)
+    - Verbose-режим (-v) с реальным временем
+    - Парсинг RAW-пакетов MeshCore v1
+"""
+
+__version__ = '1.1'
+
 import serial
 import time
 import sys
+import re
 import argparse
+import hashlib
 from collections import defaultdict
+
+try:
+    from Crypto.Cipher import AES
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
 # ========== ANSI-коды цветов для терминального вывода ==========
 GREEN = '\033[92m'
 CYAN = '\033[96m'
 YELLOW = '\033[93m'
 RED = '\033[91m'
+MAGENTA = '\033[95m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 # ===============================================================
@@ -28,11 +59,26 @@ REPEATER_PREFIX = '33'
 # Виртуальный адрес для пакетов без конкретного источника (широковещательные).
 BROADCAST_NODE = 'BCAST'
 
+# Имя бота, передающего маршруты в формате "XX: Описание репитера" (паттерн 2).
+PATHBOT_SENDER = 'AetherByte\U0001f916'  # AetherByte🤖
+
 # Интервал между циклами сбора статистики (секунды).
 CYCLE_TIME = 60
 
 # Таймаут чтения лога из серийного порта (секунды).
 READ_TIMEOUT = 5
+
+# Известные публичные каналы для расшифровки групповых сообщений.
+# Ключ шифрования = SHA256(имя_канала)[:16], хеш канала = SHA256(имя_канала)[0].
+KNOWN_CHANNEL_NAMES = [
+    'Public',       # канал по умолчанию (без #)
+    '#connections',
+    '#robot',
+    '#test',
+    '#bot-test',
+    '#server',
+    '#zapad',
+]
 # ==================================
 
 # Режим подробного вывода (включается через -v).
@@ -65,6 +111,17 @@ ROUTE_TYPES = {
 }
 # ========================================
 
+# ========== КЛЮЧИ КАНАЛОВ ==========
+# Ключ канала = SHA256(имя)[:16], хеш канала = SHA256(ключ)[0] (двойной SHA256).
+# При коллизиях хешей (напр. #server и #zapad оба дают 56) пробуем все варианты.
+# Структура: channel_hash -> [(имя, AES-ключ), ...]
+CHANNEL_KEYS = {}
+for _ch_name in KNOWN_CHANNEL_NAMES:
+    _key = hashlib.sha256(_ch_name.encode()).digest()[:16]
+    _ch_hash = hashlib.sha256(_key).digest()[0]
+    CHANNEL_KEYS.setdefault(_ch_hash, []).append((_ch_name, _key))
+# ====================================
+
 # Глобальный словарь статистики по каждому узлу.
 # Ключ — адрес узла (строка), значение — dict со счётчиками.
 stats = defaultdict(lambda: {
@@ -85,6 +142,9 @@ neighbor_stats = defaultdict(lambda: {
     'snr_sum': 0,    # Сумма SNR для расчёта среднего
     'snr_count': 0,  # Количество замеров SNR
 })
+
+# Статистика исходящих соседей (из расшифрованных групповых сообщений с path).
+outgoing_stats = defaultdict(lambda: {'total': 0})
 
 # Последний определённый сосед из RAW-пакета (для корреляции с SNR из RX-строки)
 _last_raw_neighbor = None
@@ -192,6 +252,54 @@ def read_until_eof(ser, timeout=10):
         else:
             time.sleep(0.05)
     return lines
+
+
+def extract_outgoing_neighbors(text):
+    """Извлекает исходящих соседей из расшифрованного группового сообщения.
+
+    Паттерн 1: "Found N unique path(s):" с последующими строками hex через запятую.
+    Паттерн 2: Сообщения от PATHBOT_SENDER с маршрутом в формате "XX: Описание".
+               Сообщения, начинающиеся с "..." — продолжения, игнорируются.
+
+    В обоих случаях: если первый хоп/префикс совпадает с REPEATER_PREFIX,
+    второй считается исходящим соседом.
+
+    Args:
+        text: расшифрованный текст сообщения
+
+    Returns:
+        list[str]: список адресов исходящих соседей (uppercase hex)
+    """
+    neighbors = []
+
+    # Паттерн 1: "Found N unique path(s):" + строки "XX,YY,ZZ,..."
+    parts = re.split(r'Found \d+ unique path\(s\):\s*', text)
+    for part in parts[1:]:
+        for line in part.split('\n'):
+            line = line.strip()
+            if re.match(r'^[\da-fA-F]{1,2}(,[\da-fA-F]{1,2})+$', line):
+                hops = [h.strip().upper() for h in line.split(',')]
+                if len(hops) >= 2 and hops[0].startswith(REPEATER_PREFIX.upper()):
+                    neighbors.append(hops[1])
+            else:
+                break
+
+    # Паттерн 2: сообщения от PATHBOT_SENDER в формате "XX: Описание\nYY: Описание\n..."
+    sender_prefix = PATHBOT_SENDER + ': '
+    if text.startswith(sender_prefix):
+        msg = text[len(sender_prefix):]
+        lines = msg.split('\n')
+        # Если первая строка начинается с "..." — это продолжение, игнорируем
+        if lines and not lines[0].strip().startswith('...'):
+            prefixes = []
+            for line in lines:
+                m = re.match(r'^([0-9a-fA-F]{2}):\s', line.strip())
+                if m:
+                    prefixes.append(m.group(1).upper())
+            if len(prefixes) >= 2 and prefixes[0].startswith(REPEATER_PREFIX.upper()):
+                neighbors.append(prefixes[1])
+
+    return neighbors
 
 
 def parse_line(line, stats, debug):
@@ -321,8 +429,28 @@ def parse_line(line, stats, debug):
             path_str = ','.join(parsed['path']) if parsed['path'] else '-'
             hops = parsed['path_length']
 
+            # Расшифровка групповых сообщений (для исходящих соседей и verbose)
+            decrypted = None
+            outgoing_nbs = []
+            if parsed['payload_type'] in (0x05, 0x06) and parsed['payload']:
+                decrypted = decrypt_group_msg(parsed['payload'])
+                if decrypted:
+                    outgoing_nbs = extract_outgoing_neighbors(decrypted['text'])
+                    for out_nb in outgoing_nbs:
+                        outgoing_stats[out_nb]['total'] += 1
+
             if VERBOSE:
-                print(f"    -> {pkt_label} | hops={hops} path=[{path_str}]", flush=True)
+                extra = ""
+                if decrypted:
+                    extra = f" | {decrypted['channel']}: {decrypted['text']}"
+                msg = f"    -> {pkt_label} | hops={hops} path=[{path_str}]{extra}"
+                if outgoing_nbs:
+                    # Исходящий path через наш репитер — выделяем магентой
+                    nb_list = ','.join(outgoing_nbs)
+                    print(f"{MAGENTA}{BOLD}{msg}{RESET}", flush=True)
+                    print(f"{MAGENTA}       ^^^ исходящий сосед: {nb_list}{RESET}", flush=True)
+                else:
+                    print(msg, flush=True)
 
             # Обновляем счётчик хопов в статистике для каждого узла в path
             for node_hash in parsed['path']:
@@ -475,6 +603,60 @@ def print_stats(stats, cycle_info, debug):
     print("=" * 70)
 
 
+def decrypt_group_msg(payload):
+    """Пытается расшифровать payload группового сообщения (GRP_TXT/GRP_DATA).
+
+    Формат payload (MeshCore v1):
+      [channel_hash:1][MAC:2][ciphertext]
+
+    Ciphertext = AES-128-ECB(channel_key, plaintext), zero-padded до кратности 16.
+    Plaintext:  [timestamp:4][flags:1][sender_name: message_text][zero_padding]
+
+    Channel_key = SHA256(channel_name)[:16]
+    Channel_hash = SHA256(channel_key)[0]
+
+    При коллизиях хешей пробуем все подходящие ключи.
+
+    Args:
+        payload: bytes полного payload (включая channel_hash)
+
+    Returns:
+        dict {'channel': имя, 'hash': hex-строка, 'text': расшифрованный текст}
+        или None если расшифровка не удалась
+    """
+    if not HAS_CRYPTO or len(payload) < 4:
+        return None
+
+    ch_hash = payload[0]
+    if ch_hash not in CHANNEL_KEYS:
+        return None
+
+    # MAC (2 байта) + ciphertext
+    ciphertext = bytes(payload[3:])
+
+    if len(ciphertext) == 0 or len(ciphertext) % 16 != 0:
+        return None
+
+    # Пробуем все ключи с совпадающим хешем (обработка коллизий)
+    for ch_name, key in CHANNEL_KEYS[ch_hash]:
+        try:
+            cipher = AES.new(key, AES.MODE_ECB)
+            plaintext = cipher.decrypt(ciphertext)
+
+            # Пропускаем timestamp (4B) и flags (1B), остальное — текст
+            if len(plaintext) < 6:
+                continue
+            text = plaintext[5:].rstrip(b'\x00').decode('utf-8', errors='ignore').strip()
+
+            # Проверяем, что расшифрованный текст похож на читаемый
+            if text and sum(c.isprintable() for c in text) > len(text) // 2:
+                return {'channel': ch_name, 'hash': f"{ch_hash:02X}", 'text': text}
+        except Exception:
+            continue
+
+    return None
+
+
 def decode_payload_info(payload_type, payload):
     """Извлекает доступную информацию из payload пакета.
 
@@ -488,8 +670,11 @@ def decode_payload_info(payload_type, payload):
     if not payload:
         return ""
 
-    # GRP_TXT (5) / GRP_DATA (6): первый байт — channel hash, остальное зашифровано
+    # GRP_TXT (5) / GRP_DATA (6): пытаемся расшифровать, иначе показываем хеш канала
     if payload_type in (0x05, 0x06):
+        decrypted = decrypt_group_msg(payload)
+        if decrypted:
+            return f"Канал: {decrypted['channel']} | {decrypted['text']}"
         channel_hash = f"{payload[0]:02X}"
         return f"Канал: {channel_hash} (текст зашифрован)"
 
@@ -579,15 +764,13 @@ def print_neighbors(cycle_info):
     sorted_neighbors = sorted(neighbor_stats.items(), key=lambda x: x[1]['total'], reverse=True)
     grand_total = sum(d['total'] for d in neighbor_stats.values())
 
-    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6} {'SNR ср':>8}")
+    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6} {'->RPT':>6} {'->OBS':>6}")
     print("-" * 70)
 
     for node, data in sorted_neighbors:
         pct = data['total'] / grand_total * 100 if grand_total > 0 else 0
-        avg_snr = data['snr_sum'] / data['snr_count'] if data['snr_count'] > 0 else 0
-        snr_str = f"{avg_snr:>6.1f}dB" if data['snr_count'] > 0 else "     n/a"
 
-        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {snr_str}"
+        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {data['rpt']:>6} {data['obs']:>6}"
 
         if node.startswith(REPEATER_PREFIX):
             print(f"{CYAN}{base_line}{RESET}")
@@ -598,6 +781,47 @@ def print_neighbors(cycle_info):
 
     print("-" * 70)
     print(f"Всего пакетов от соседей: {grand_total}")
+    print("=" * 70)
+
+
+def print_outgoing_neighbors(cycle_info):
+    """Выводит таблицу исходящих соседей — через кого уходят наши сообщения.
+
+    Определяется из расшифрованных групповых сообщений, содержащих
+    "Found N unique path(s): XX,YY,ZZ,...". Если первый хоп совпадает
+    с REPEATER_PREFIX, то второй хоп — исходящий сосед.
+
+    Args:
+        cycle_info: dict с данными цикла
+    """
+    print("\n" + "=" * 70)
+    print(f"ИСХОДЯЩИЕ СОСЕДИ (цикл {cycle_info['num']})")
+    print("=" * 70)
+
+    if not outgoing_stats:
+        print("  Нет данных (нужны расшифрованные сообщения с path)")
+        print("=" * 70)
+        return
+
+    sorted_out = sorted(outgoing_stats.items(), key=lambda x: x[1]['total'], reverse=True)
+    grand_total = sum(d['total'] for d in outgoing_stats.values())
+
+    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6}")
+    print("-" * 70)
+
+    for node, data in sorted_out:
+        pct = data['total'] / grand_total * 100 if grand_total > 0 else 0
+        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}%"
+
+        if node.upper().startswith(REPEATER_PREFIX.upper()):
+            print(f"{CYAN}{base_line}{RESET}")
+        elif node.upper().startswith(NODE_PREFIX.upper()):
+            print(f"{GREEN}{base_line}{RESET}")
+        else:
+            print(base_line)
+
+    print("-" * 70)
+    print(f"Всего исходящих через соседей: {grand_total}")
     print("=" * 70)
 
 
@@ -617,7 +841,12 @@ def main(args):
     try:
         ser = serial.Serial(PORT, BAUDRATE, timeout=1)
         print(f"Подключён к {PORT}")
-        print(f"Цикл статистики: каждые {CYCLE_TIME} сек\n")
+        print(f"Цикл статистики: каждые {CYCLE_TIME} сек")
+        if HAS_CRYPTO:
+            print(f"Дешифрование каналов: {', '.join(KNOWN_CHANNEL_NAMES)}")
+        else:
+            print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
+        print()
         time.sleep(2)
 
         # Включаем логирование на ноде
@@ -668,6 +897,7 @@ def main(args):
                 print_stats(stats, cycle_info, debug)
             if args.neighbors:
                 print_neighbors(cycle_info)
+                print_outgoing_neighbors(cycle_info)
             if args.path:
                 print_max_hops(cycle_info)
 
@@ -688,6 +918,7 @@ def main(args):
             print_stats(stats, cycle_info, {})
         if args.neighbors:
             print_neighbors(cycle_info)
+            print_outgoing_neighbors(cycle_info)
         if args.path:
             print_max_hops(cycle_info)
     finally:
@@ -713,8 +944,8 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--original', action='store_true',
                         help='Показывать накопительную статистику по узлам (RX/TX/SNR/RSSI)')
     parser.add_argument('-n', '--neighbors', action='store_true',
-                        help='Показывать таблицу соседей — кто доставляет пакеты '
-                             'ретранслятору и наблюдателю (по данным path)')
+                        help='Показывать таблицы входящих и исходящих соседей '
+                             '(входящие — из path, исходящие — из расшифрованных сообщений)')
     parser.add_argument('-p', '--path', action='store_true',
                         help='Показывать пакет-рекордсмен по числу хопов '
                              '(тип, путь, канал для групповых сообщений)')
