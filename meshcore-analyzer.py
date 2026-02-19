@@ -1,8 +1,16 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 1.1
+Version: 1.2
 
 Changelog:
+  v1.2 — Переподключение, сохранение статистики, CLI
+    - Автоматическое переподключение при потере USB-соединения
+    - Сохранение статистики в файл meshcore-stats.json между запусками
+    - Опция --reset для сброса накопленной статистики
+    - Опция -p/--port для указания серийного порта
+    - Опция --hops (вместо -p/--path) для рекорда хопов
+    - Фоновое чтение порта через отдельный поток (без потери пакетов)
+    - Связь с meshcore-probe для автоматического зондирования каналов
   v1.1 — Дешифрование каналов, исходящие соседи
     - Расшифровка групповых сообщений (GRP_TXT/GRP_DATA) публичных каналов (AES-128-ECB)
     - Таблица исходящих соседей (-n): кто ретранслирует наши исходящие пакеты
@@ -18,14 +26,18 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '1.1'
+__version__ = '1.2'
 
 import serial
 import time
 import sys
+import os
 import re
+import json
 import argparse
 import hashlib
+import threading
+import queue
 from collections import defaultdict
 
 try:
@@ -151,6 +163,60 @@ _last_raw_neighbor = None
 
 # Рекорд максимального числа хопов (dict с данными пакета или None)
 max_hops_record = None
+
+# Путь к файлу сохранения статистики (рядом со скриптом)
+STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'meshcore-stats.json')
+
+
+def save_stats():
+    """Сохраняет накопленную статистику в JSON-файл."""
+    data = {
+        'stats': dict(stats),
+        'neighbor_stats': dict(neighbor_stats),
+        'outgoing_stats': dict(outgoing_stats),
+        'max_hops_record': None,
+    }
+    if max_hops_record:
+        # payload — bytes, конвертируем в hex для JSON
+        r = dict(max_hops_record)
+        if isinstance(r.get('payload'), (bytes, bytearray)):
+            r['payload'] = r['payload'].hex()
+        data['max_hops_record'] = r
+    try:
+        with open(STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"{YELLOW}Ошибка сохранения статистики: {e}{RESET}")
+
+
+def load_stats():
+    """Загружает статистику из JSON-файла, если он существует."""
+    global max_hops_record
+    if not os.path.exists(STATS_FILE):
+        return
+    try:
+        with open(STATS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for node, vals in data.get('stats', {}).items():
+            for k, v in vals.items():
+                stats[node][k] = v
+        for node, vals in data.get('neighbor_stats', {}).items():
+            for k, v in vals.items():
+                neighbor_stats[node][k] = v
+        for node, vals in data.get('outgoing_stats', {}).items():
+            for k, v in vals.items():
+                outgoing_stats[node][k] = v
+        r = data.get('max_hops_record')
+        if r:
+            # Восстанавливаем payload из hex в bytes
+            if isinstance(r.get('payload'), str):
+                r['payload'] = bytes.fromhex(r['payload'])
+            max_hops_record = r
+        total_rx = sum(d['rx'] for d in stats.values())
+        print(f"Загружена статистика: {len(stats)} узлов, {total_rx} RX, "
+              f"{len(neighbor_stats)} соседей, {len(outgoing_stats)} исх. соседей")
+    except Exception as e:
+        print(f"{YELLOW}Ошибка загрузки статистики: {e}{RESET}")
 
 
 def parse_raw(hex_str):
@@ -440,17 +506,21 @@ def parse_line(line, stats, debug):
                         outgoing_stats[out_nb]['total'] += 1
 
             if VERBOSE:
-                extra = ""
+                color = f"{MAGENTA}{BOLD}" if outgoing_nbs else ""
+                end = RESET if outgoing_nbs else ""
+                print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{end}", flush=True)
                 if decrypted:
-                    extra = f" | {decrypted['channel']}: {decrypted['text']}"
-                msg = f"    -> {pkt_label} | hops={hops} path=[{path_str}]{extra}"
+                    text = decrypted['text']
+                    # Отделяем имя отправителя (до первого ": ") от тела сообщения
+                    if ': ' in text:
+                        sender, body = text.split(': ', 1)
+                        print(f"{color}       {decrypted['channel']}: {sender}:{end}", flush=True)
+                        for tl in body.split('\n'):
+                            print(f"{color}       {tl}{end}", flush=True)
+                    else:
+                        print(f"{color}       {decrypted['channel']}: {text}{end}", flush=True)
                 if outgoing_nbs:
-                    # Исходящий path через наш репитер — выделяем магентой
-                    nb_list = ','.join(outgoing_nbs)
-                    print(f"{MAGENTA}{BOLD}{msg}{RESET}", flush=True)
-                    print(f"{MAGENTA}       ^^^ исходящий сосед: {nb_list}{RESET}", flush=True)
-                else:
-                    print(msg, flush=True)
+                    print(f"{MAGENTA}       ^^^ исходящий сосед: {','.join(outgoing_nbs)}{RESET}", flush=True)
 
             # Обновляем счётчик хопов в статистике для каждого узла в path
             for node_hash in parsed['path']:
@@ -825,69 +895,92 @@ def print_outgoing_neighbors(cycle_info):
     print("=" * 70)
 
 
-def main(args):
-    """Главный цикл работы анализатора.
+def _serial_reader(ser, line_queue, stop_event, error_event):
+    """Фоновый поток: непрерывно читает серийный порт и кладёт строки в очередь.
 
-    Алгоритм:
-      1. Открывает серийный порт и подключается к ноде Meshcore
-      2. Отправляет команду "log start" для включения логирования на ноде
-      3. В бесконечном цикле:
-         a) Читает серийный порт в реальном времени в течение CYCLE_TIME секунд
-         b) Парсит каждую строку, обновляя статистику (в режиме -v печатает пакеты)
-         c) В конце цикла выводит выбранные отчёты (-o, -n)
-      4. При Ctrl+C — выводит финальную статистику и закрывает порт
+    Работает даже во время вывода статистики, чтобы не терять пакеты
+    из-за переполнения буфера серийного порта.
+    При ошибке порта устанавливает error_event для уведомления основного потока.
+    """
+    while not stop_event.is_set():
+        try:
+            if ser.in_waiting:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    line_queue.put(line)
+            else:
+                time.sleep(0.02)
+        except Exception:
+            error_event.set()
+            break
+
+
+RECONNECT_INTERVAL = 5  # секунд между попытками переподключения
+
+
+def _wait_for_port(port):
+    """Ожидает появления серийного порта, проверяя каждые RECONNECT_INTERVAL сек."""
+    while True:
+        if os.path.exists(port):
+            return
+        time.sleep(RECONNECT_INTERVAL)
+
+
+def _connect_and_run(args, port, cycle_counter):
+    """Подключается к порту, запускает чтение и цикл анализа.
+
+    Возвращает True если нужно переподключиться, False если завершение.
     """
     ser = None
+    stop_event = threading.Event()
+    error_event = threading.Event()
+    reader_thread = None
     try:
-        ser = serial.Serial(PORT, BAUDRATE, timeout=1)
-        print(f"Подключён к {PORT}")
+        ser = serial.Serial(port, BAUDRATE, timeout=1)
+        print(f"\nПодключён к {port}")
         print(f"Цикл статистики: каждые {CYCLE_TIME} сек")
         if HAS_CRYPTO:
             print(f"Дешифрование каналов: {', '.join(KNOWN_CHANNEL_NAMES)}")
         else:
             print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
-        print()
+        print(flush=True)
         time.sleep(2)
 
-        # Включаем логирование на ноде
         send_cmd(ser, "log start")
-        print("Логирование включено")
+        print("Логирование включено", flush=True)
         time.sleep(1)
 
-        cycle = 0
-        while True:
-            cycle += 1
+        line_queue = queue.Queue()
+        reader_thread = threading.Thread(
+            target=_serial_reader, args=(ser, line_queue, stop_event, error_event),
+            daemon=True
+        )
+        reader_thread.start()
 
-            # Отладочные счётчики для текущего цикла
+        while True:
+            cycle_counter[0] += 1
+
             debug = {
-                'total': 0,
-                'rx_lines': 0,
-                'tx_lines': 0,
-                'ignored': 0,
-                'malformed': 0,
-                'broadcast_rx': 0,
-                'broadcast_tx': 0,
-                'exception': 0,
-                'exception_tx': 0,
-                'ignored_samples': [],
-                'no_src_dst': 0,
+                'total': 0, 'rx_lines': 0, 'tx_lines': 0,
+                'ignored': 0, 'malformed': 0, 'broadcast_rx': 0,
+                'broadcast_tx': 0, 'exception': 0, 'exception_tx': 0,
+                'ignored_samples': [], 'no_src_dst': 0,
             }
 
-            # Активное чтение порта в течение CYCLE_TIME секунд.
-            # В режиме -v каждая строка печатается сразу при поступлении.
             lines_read = 0
             cycle_start = time.time()
             while time.time() - cycle_start < CYCLE_TIME:
-                if ser.in_waiting:
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        lines_read += 1
-                        parse_line(line, stats, debug)
-                else:
-                    time.sleep(0.05)
+                if error_event.is_set():
+                    raise serial.SerialException("Устройство отключено")
+                try:
+                    line = line_queue.get(timeout=0.1)
+                    lines_read += 1
+                    parse_line(line, stats, debug)
+                except queue.Empty:
+                    pass
 
             cycle_info = {
-                'num': cycle,
+                'num': cycle_counter[0],
                 'lines_read': lines_read,
                 'rx_this': debug['rx_lines'],
                 'tx_this': debug['tx_lines'],
@@ -898,12 +991,46 @@ def main(args):
             if args.neighbors:
                 print_neighbors(cycle_info)
                 print_outgoing_neighbors(cycle_info)
-            if args.path:
+            if args.hops:
                 print_max_hops(cycle_info)
 
+            save_stats()
+
     except serial.SerialException as e:
-        print(f"\nОшибка порта: {e}")
-        print(f"Проверьте подключение и имя порта: ls /dev/cu.*")
+        save_stats()
+        print(f"\n{YELLOW}Потеря соединения: {e}{RESET}", flush=True)
+        return True
+    finally:
+        stop_event.set()
+        if reader_thread:
+            reader_thread.join(timeout=2)
+        if ser:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+
+def main(args):
+    """Главный цикл работы анализатора с автоматическим переподключением."""
+    port = args.port
+    cycle_counter = [0]
+
+    try:
+        while True:
+            if not os.path.exists(port):
+                print(f"Порт {port} не найден. Ожидание подключения...", flush=True)
+                _wait_for_port(port)
+                time.sleep(2)
+
+            need_reconnect = _connect_and_run(args, port, cycle_counter)
+            if not need_reconnect:
+                break
+
+            print(f"Ожидание переподключения к {port}...", flush=True)
+            _wait_for_port(port)
+            time.sleep(2)
+
     except KeyboardInterrupt:
         print("\n\nОстановлено пользователем")
         total_rx = sum(d['rx'] for d in stats.values())
@@ -919,11 +1046,9 @@ def main(args):
         if args.neighbors:
             print_neighbors(cycle_info)
             print_outgoing_neighbors(cycle_info)
-        if args.path:
+        if args.hops:
             print_max_hops(cycle_info)
-    finally:
-        if ser:
-            ser.close()
+        save_stats()
 
 
 if __name__ == "__main__":
@@ -946,12 +1071,23 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--neighbors', action='store_true',
                         help='Показывать таблицы входящих и исходящих соседей '
                              '(входящие — из path, исходящие — из расшифрованных сообщений)')
-    parser.add_argument('-p', '--path', action='store_true',
+    parser.add_argument('--hops', action='store_true',
                         help='Показывать пакет-рекордсмен по числу хопов '
                              '(тип, путь, канал для групповых сообщений)')
+    parser.add_argument('-p', '--port', default=PORT,
+                        help=f'Серийный порт Observer-ноды (по умолчанию {PORT})')
+    parser.add_argument('--reset', action='store_true',
+                        help='Сбросить сохранённую статистику и начать с нуля')
     args = parser.parse_args()
     VERBOSE = args.verbose
     # Если ни один режим вывода не указан, показываем оригинальную статистику
-    if not args.original and not args.neighbors and not args.path:
+    if not args.original and not args.neighbors and not args.hops:
         args.original = True
+    # Загрузка или сброс статистики
+    if args.reset:
+        if os.path.exists(STATS_FILE):
+            os.remove(STATS_FILE)
+            print("Статистика сброшена")
+    else:
+        load_stats()
     main(args)
