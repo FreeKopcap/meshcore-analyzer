@@ -38,6 +38,7 @@ import argparse
 import hashlib
 import threading
 import queue
+import urllib.request
 from collections import defaultdict
 
 try:
@@ -95,6 +96,8 @@ KNOWN_CHANNEL_NAMES = [
 
 # Режим подробного вывода (включается через -v).
 VERBOSE = False
+# Режим поиска исходящих соседей через ботов в каналах (включается через --bots).
+BOTS_MODE = False
 
 # ========== MESHCORE PROTOCOL ==========
 # Маппинг типов пакетов (payload type, биты 2-5 заголовка)
@@ -166,6 +169,14 @@ max_hops_record = None
 
 # Путь к файлу сохранения статистики (рядом со скриптом)
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'meshcore-stats.json')
+
+# API MeshCoreTel для получения пакетов от всех наблюдателей региона
+MESHCORETEL_API = 'https://meshcoretel.ru/api/packets'
+
+# ID последнего обработанного пакета из API (для инкрементальных запросов)
+_api_last_id = None
+# Множество обработанных хешей пакетов (дедупликация: один пакет виден многим наблюдателям)
+_api_seen_hashes = set()
 
 
 def save_stats():
@@ -495,12 +506,12 @@ def parse_line(line, stats, debug):
             path_str = ','.join(parsed['path']) if parsed['path'] else '-'
             hops = parsed['path_length']
 
-            # Расшифровка групповых сообщений (для исходящих соседей и verbose)
+            # Расшифровка групповых сообщений
             decrypted = None
             outgoing_nbs = []
             if parsed['payload_type'] in (0x05, 0x06) and parsed['payload']:
                 decrypted = decrypt_group_msg(parsed['payload'])
-                if decrypted:
+                if decrypted and BOTS_MODE:
                     outgoing_nbs = extract_outgoing_neighbors(decrypted['text'])
                     for out_nb in outgoing_nbs:
                         outgoing_stats[out_nb]['total'] += 1
@@ -511,7 +522,6 @@ def parse_line(line, stats, debug):
                 print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{end}", flush=True)
                 if decrypted:
                     text = decrypted['text']
-                    # Отделяем имя отправителя (до первого ": ") от тела сообщения
                     if ': ' in text:
                         sender, body = text.split(': ', 1)
                         print(f"{color}       {decrypted['channel']}: {sender}:{end}", flush=True)
@@ -520,7 +530,7 @@ def parse_line(line, stats, debug):
                     else:
                         print(f"{color}       {decrypted['channel']}: {text}{end}", flush=True)
                 if outgoing_nbs:
-                    print(f"{MAGENTA}       ^^^ исходящий сосед: {','.join(outgoing_nbs)}{RESET}", flush=True)
+                    print(f"{MAGENTA}       ^^^ бот: исходящий сосед: {','.join(outgoing_nbs)}{RESET}", flush=True)
 
             # Обновляем счётчик хопов в статистике для каждого узла в path
             for node_hash in parsed['path']:
@@ -869,7 +879,7 @@ def print_outgoing_neighbors(cycle_info):
     print("=" * 70)
 
     if not outgoing_stats:
-        print("  Нет данных (нужны расшифрованные сообщения с path)")
+        print("  Нет данных (включите --api или ждите расшифрованных сообщений с path)")
         print("=" * 70)
         return
 
@@ -893,6 +903,94 @@ def print_outgoing_neighbors(cycle_info):
     print("-" * 70)
     print(f"Всего исходящих через соседей: {grand_total}")
     print("=" * 70)
+
+
+def fetch_outgoing_from_api(repeater_prefix):
+    """Получает пакеты из API MeshCoreTel и обновляет outgoing_stats.
+
+    Ищет пакеты, в path_hops которых встречается repeater_prefix.
+    Следующий хоп после repeater_prefix — исходящий сосед.
+    Дедупликация по hash пакета (один пакет виден нескольким наблюдателям).
+    Пагинация: забирает все новые пакеты с момента последнего запроса.
+
+    Returns:
+        int: количество новых исходящих соседей, найденных в этом запросе
+    """
+    global _api_last_id
+    prefix_upper = repeater_prefix.upper()
+    found = 0
+    total_fetched = 0
+    page_limit = 500
+    max_pages = 5
+
+    for page in range(max_pages):
+        try:
+            url = f'{MESHCORETEL_API}?limit={page_limit}'
+            if _api_last_id is not None:
+                url += f'&since_id={_api_last_id}'
+            req = urllib.request.Request(url, headers={'User-Agent': 'meshcore-analyzer'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                packets = json.loads(resp.read())
+        except Exception:
+            if VERBOSE:
+                print(f"  {YELLOW}[API] таймаут, повтор через 15 сек{RESET}", flush=True)
+            break
+
+        if not packets:
+            break
+
+        total_fetched += len(packets)
+        min_id = min(p['id'] for p in packets)
+        max_id = max(p['id'] for p in packets)
+        if _api_last_id is None or max_id > _api_last_id:
+            _api_last_id = max_id
+
+        for pkt in packets:
+            pkt_hash = pkt.get('hash', '')
+            if not pkt_hash or pkt_hash in _api_seen_hashes:
+                continue
+            _api_seen_hashes.add(pkt_hash)
+
+            hops = pkt.get('path_hops')
+            if not hops:
+                continue
+
+            for i, hop in enumerate(hops):
+                if hop.upper() != prefix_upper:
+                    continue
+                if i + 1 >= len(hops):
+                    break
+                neighbor = hops[i + 1].upper()
+                outgoing_stats[neighbor]['total'] += 1
+                found += 1
+                if VERBOSE:
+                    origin = pkt.get('origin', '?')
+                    path_str = ' → '.join(hops)
+                    ptype = PAYLOAD_TYPES.get(pkt.get('payload_type', -1), '?')
+                    print(f"  {CYAN}[API] {origin}: {ptype} "
+                          f"[{path_str}] → сосед {BOLD}{neighbor}{RESET}", flush=True)
+                break
+
+        if len(packets) < page_limit:
+            break
+
+    if len(_api_seen_hashes) > 50000:
+        _api_seen_hashes.clear()
+
+    return found
+
+
+def _api_poller(repeater_prefix, stop_event, duration):
+    """Фоновый поток: периодически опрашивает API MeshCoreTel в течение цикла."""
+    poll_interval = 15
+    deadline = time.time() + duration
+    while not stop_event.is_set() and time.time() < deadline:
+        fetch_outgoing_from_api(repeater_prefix)
+        # Спим интервал, но проверяем stop_event каждую секунду
+        for _ in range(poll_interval):
+            if stop_event.is_set() or time.time() >= deadline:
+                return
+            time.sleep(1)
 
 
 def _serial_reader(ser, line_queue, stop_event, error_event):
@@ -943,6 +1041,8 @@ def _connect_and_run(args, port, cycle_counter):
             print(f"Дешифрование каналов: {', '.join(KNOWN_CHANNEL_NAMES)}")
         else:
             print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
+        if args.api:
+            print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
         print(flush=True)
         time.sleep(2)
 
@@ -969,6 +1069,15 @@ def _connect_and_run(args, port, cycle_counter):
 
             lines_read = 0
             cycle_start = time.time()
+
+            if args.api:
+                api_thread = threading.Thread(
+                    target=_api_poller,
+                    args=(args.repeater, stop_event, CYCLE_TIME),
+                    daemon=True
+                )
+                api_thread.start()
+
             while time.time() - cycle_start < CYCLE_TIME:
                 if error_event.is_set():
                     raise serial.SerialException("Устройство отключено")
@@ -1076,10 +1185,22 @@ if __name__ == "__main__":
                              '(тип, путь, канал для групповых сообщений)')
     parser.add_argument('-p', '--port', default=PORT,
                         help=f'Серийный порт Observer-ноды (по умолчанию {PORT})')
+    parser.add_argument('--api', action='store_true',
+                        help='Получать исходящих соседей из API meshcoretel.ru '
+                             '(не требует отправки p/mt в канал)')
+    parser.add_argument('--repeater', default=REPEATER_PREFIX,
+                        help=f'Префикс ретранслятора для поиска через API '
+                             f'(по умолчанию {REPEATER_PREFIX})')
+    parser.add_argument('--bots', action='store_true',
+                        help='Определять исходящих соседей из ответов ботов в каналах '
+                             '(требует отправки p/mt через meshcore-probe)')
     parser.add_argument('--reset', action='store_true',
                         help='Сбросить сохранённую статистику и начать с нуля')
     args = parser.parse_args()
     VERBOSE = args.verbose
+    BOTS_MODE = args.bots
+    if args.api and not args.neighbors:
+        args.neighbors = True
     # Если ни один режим вывода не указан, показываем оригинальную статистику
     if not args.original and not args.neighbors and not args.hops:
         args.original = True
