@@ -599,7 +599,7 @@ def parse_line(line, stats, debug):
 
                 if parsed.get('trace_route') is not None:
                     route_str = '→'.join(parsed['trace_route']) if parsed['trace_route'] else '?'
-                    snr_str = ','.join(f"{s:.1f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
+                    snr_str = ','.join(f"{s:.2f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
                     print(f"    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]", flush=True)
                 else:
                     dest_tag = f" -> {parsed['dest']}" if parsed.get('dest') else ""
@@ -625,7 +625,7 @@ def parse_line(line, stats, debug):
                     dec_info = f" | {decrypted['channel']}: {decrypted['text']}"
                 if parsed.get('trace_snr') is not None:
                     route_str = '→'.join(parsed['trace_route']) if parsed.get('trace_route') else '?'
-                    snr_str = ','.join(f"{s:.1f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
+                    snr_str = ','.join(f"{s:.2f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
                     log_line = f"{pkt_time} | {pkt_label} | route=[{route_str}] SNR=[{snr_str}]\n"
                 else:
                     log_line = f"{pkt_time} | {pkt_label} | hops={hops} path=[{path_str}]{dest_info}{obs_info}{dec_info}\n"
@@ -932,8 +932,8 @@ def print_neighbors(cycle_info):
     for node, data in sorted_neighbors:
         pct = data['total'] / grand_total * 100 if grand_total > 0 else 0
 
-        snr_out = f"{data['trace_out_sum'] / data['trace_out_count']:.1f}" if data.get('trace_out_count') else "-"
-        snr_in = f"{data['trace_in_sum'] / data['trace_in_count']:.1f}" if data.get('trace_in_count') else "-"
+        snr_out = f"{data['trace_out_sum'] / data['trace_out_count']:.2f}" if data.get('trace_out_count') else "-"
+        snr_in = f"{data['trace_in_sum'] / data['trace_in_count']:.2f}" if data.get('trace_in_count') else "-"
 
         base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {snr_out:>7} {snr_in:>7}"
 
