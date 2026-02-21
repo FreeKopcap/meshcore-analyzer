@@ -1,12 +1,17 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 2.1
+Version: 2.2
 
 Changelog:
+  v2.2 — SNR соседей из TRACE, полный debug-лог
+    - Столбцы SNR→/SNR← в таблице соседей (средний SNR туда/обратно из TRACE)
+    - TRACE-ответы учитываются в таблицах соседей и исходящих соседей
+    - Signed SNR в TRACE (поддержка отрицательных значений)
+    - API: фильтрация TRACE-пакетов (path содержит SNR, не узлы)
+    - Опция -d/--debug: полный лог всех пакетов (RAW + API + TRACE)
   v2.1 — Декодирование TRACE, отладка ->OBS, точная статистика соседей
     - Декодирование DIRECT TRACE: SNR на каждом хопе и маршрут трассировки
     - Статистика соседей только по FLOOD-пакетам (DIRECT не искажают таблицу)
-    - Опция -d/--debug: логирование пакетов ->OBS в файл meshcore-debug.log
     - Подсветка ->OBS пакетов жёлтым + метка [OBS] в verbose
     - Отображение destination для DIRECT-пакетов в verbose
   v2.0 — Исходящие соседи через API MeshCoreTel
@@ -37,7 +42,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '2.1'
+__version__ = '2.2'
 
 import serial
 import time
@@ -165,11 +170,13 @@ stats = defaultdict(lambda: {
 
 # Статистика соседей: кто доставляет пакеты ретранслятору и наблюдателю.
 neighbor_stats = defaultdict(lambda: {
-    'rpt': 0,        # Доставлено ретранслятору
-    'obs': 0,        # Доставлено наблюдателю
-    'total': 0,      # Всего
-    'snr_sum': 0,    # Сумма SNR для расчёта среднего
-    'snr_count': 0,  # Количество замеров SNR
+    'total': 0,
+    'snr_sum': 0,          # SNR при приёме observer (из RX-строки)
+    'snr_count': 0,
+    'trace_out_sum': 0,    # SNR→ (репитер → сосед, из TRACE)
+    'trace_out_count': 0,
+    'trace_in_sum': 0,     # SNR← (сосед → репитер, из TRACE)
+    'trace_in_count': 0,
 })
 
 # Статистика исходящих соседей (из расшифрованных групповых сообщений с path).
@@ -298,7 +305,8 @@ def parse_raw(hex_str):
         trace_route = None
         trace_snr = None
         if payload_type == 0x09 and route_type in (0x02, 0x03):
-            trace_snr = [b / 4.0 for b in data[offset:offset + path_length]]
+            trace_snr = [(b - 256 if b > 127 else b) / 4.0
+                         for b in data[offset:offset + path_length]]
             if len(payload) > 9:
                 trace_route = [f"{b:02X}" for b in payload[9:]]
 
@@ -557,14 +565,28 @@ def parse_line(line, stats, debug):
                 if last.startswith(REPEATER_PREFIX):
                     if len(parsed['path']) >= 2:
                         nb = parsed['path'][-2]
-                        neighbor_stats[nb]['rpt'] += 1
                         neighbor_stats[nb]['total'] += 1
                         _last_raw_neighbor = nb
                 else:
-                    neighbor_stats[last]['obs'] += 1
                     neighbor_stats[last]['total'] += 1
                     _last_raw_neighbor = last
                     direct_to_obs = True
+
+            # TRACE: собираем SNR→/SNR← и считаем соседа (входящего + исходящего)
+            if parsed.get('trace_snr') and parsed.get('trace_route'):
+                tr = parsed['trace_route']
+                ts = parsed['trace_snr']
+                if (len(tr) >= 3
+                        and tr[0].upper().startswith(REPEATER_PREFIX.upper())
+                        and len(ts) >= 2):
+                    nb = tr[1].upper()
+                    neighbor_stats[nb]['total'] += 1
+                    neighbor_stats[nb]['trace_out_sum'] += ts[1]
+                    neighbor_stats[nb]['trace_out_count'] += 1
+                    outgoing_stats[nb]['total'] += 1
+                    if len(ts) >= len(tr):
+                        neighbor_stats[nb]['trace_in_sum'] += ts[-1]
+                        neighbor_stats[nb]['trace_in_count'] += 1
 
             if VERBOSE:
                 if outgoing_nbs:
@@ -594,13 +616,19 @@ def parse_line(line, stats, debug):
                 if outgoing_nbs:
                     print(f"{MAGENTA}       ^^^ бот: исходящий сосед: {','.join(outgoing_nbs)}{RESET}", flush=True)
 
-            if direct_to_obs and DEBUG_MODE:
+            if DEBUG_MODE:
                 pkt_time = line.split(' U RAW:')[0].strip() if ' U RAW:' in line else '?'
                 dest_info = f" -> {parsed['dest']}" if parsed.get('dest') else ""
+                obs_info = " [OBS]" if direct_to_obs else ""
                 dec_info = ""
                 if decrypted:
                     dec_info = f" | {decrypted['channel']}: {decrypted['text']}"
-                log_line = f"{pkt_time} | {pkt_label} | hops={hops} path=[{path_str}]{dest_info} | ->OBS via {last}{dec_info}\n"
+                if parsed.get('trace_snr') is not None:
+                    route_str = '→'.join(parsed['trace_route']) if parsed.get('trace_route') else '?'
+                    snr_str = ','.join(f"{s:.1f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
+                    log_line = f"{pkt_time} | {pkt_label} | route=[{route_str}] SNR=[{snr_str}]\n"
+                else:
+                    log_line = f"{pkt_time} | {pkt_label} | hops={hops} path=[{path_str}]{dest_info}{obs_info}{dec_info}\n"
                 with open(DEBUG_LOG, 'a') as f:
                     f.write(log_line)
 
@@ -880,9 +908,8 @@ def print_max_hops(cycle_info):
 def print_neighbors(cycle_info):
     """Выводит таблицу соседей — узлов, доставляющих пакеты ретранслятору и наблюдателю.
 
-    Сосед определяется из path пакета:
-      - Если последний хоп = REPEATER_PREFIX → предпоследний доставил ретранслятору
-      - Иначе → последний хоп доставил напрямую наблюдателю
+    Сосед определяется из path FLOOD-пакетов.
+    SNR→/SNR← — средние уровни сигнала из TRACE-пакетов.
 
     Args:
         cycle_info: dict с данными цикла
@@ -896,17 +923,19 @@ def print_neighbors(cycle_info):
         print("=" * 70)
         return
 
-    # Сортируем по общему количеству пакетов (убывание)
     sorted_neighbors = sorted(neighbor_stats.items(), key=lambda x: x[1]['total'], reverse=True)
     grand_total = sum(d['total'] for d in neighbor_stats.values())
 
-    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6} {'->RPT':>6} {'->OBS':>6}")
+    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6} {'SNR→':>7} {'SNR←':>7}")
     print("-" * 70)
 
     for node, data in sorted_neighbors:
         pct = data['total'] / grand_total * 100 if grand_total > 0 else 0
 
-        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {data['rpt']:>6} {data['obs']:>6}"
+        snr_out = f"{data['trace_out_sum'] / data['trace_out_count']:.1f}" if data.get('trace_out_count') else "-"
+        snr_in = f"{data['trace_in_sum'] / data['trace_in_count']:.1f}" if data.get('trace_in_count') else "-"
+
+        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {snr_out:>7} {snr_in:>7}"
 
         if node.startswith(REPEATER_PREFIX):
             print(f"{CYAN}{base_line}{RESET}")
@@ -1007,6 +1036,9 @@ def fetch_outgoing_from_api(repeater_prefix):
                 continue
             _api_seen_hashes.add(pkt_hash)
 
+            if pkt.get('payload_type') == 0x09:
+                continue
+
             hops = pkt.get('path_hops')
             if not hops:
                 continue
@@ -1019,12 +1051,15 @@ def fetch_outgoing_from_api(repeater_prefix):
                 neighbor = hops[i + 1].upper()
                 outgoing_stats[neighbor]['total'] += 1
                 found += 1
+                origin = pkt.get('origin', '?')
+                path_str = ' → '.join(hops)
+                ptype = PAYLOAD_TYPES.get(pkt.get('payload_type', -1), '?')
                 if VERBOSE:
-                    origin = pkt.get('origin', '?')
-                    path_str = ' → '.join(hops)
-                    ptype = PAYLOAD_TYPES.get(pkt.get('payload_type', -1), '?')
                     print(f"  {CYAN}[API] {origin}: {ptype} "
                           f"[{path_str}] → сосед {BOLD}{neighbor}{RESET}", flush=True)
+                if DEBUG_MODE:
+                    with open(DEBUG_LOG, 'a') as f:
+                        f.write(f"[API] {origin}: {ptype} [{path_str}] → сосед {neighbor}\n")
                 break
 
         if len(packets) < page_limit:
