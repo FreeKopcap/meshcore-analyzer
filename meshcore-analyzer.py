@@ -1,8 +1,21 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 1.2
+Version: 2.1
 
 Changelog:
+  v2.1 — Декодирование TRACE, отладка ->OBS, точная статистика соседей
+    - Декодирование DIRECT TRACE: SNR на каждом хопе и маршрут трассировки
+    - Статистика соседей только по FLOOD-пакетам (DIRECT не искажают таблицу)
+    - Опция -d/--debug: логирование пакетов ->OBS в файл meshcore-debug.log
+    - Подсветка ->OBS пакетов жёлтым + метка [OBS] в verbose
+    - Отображение destination для DIRECT-пакетов в verbose
+  v2.0 — Исходящие соседи через API MeshCoreTel
+    - Опция --api: получение исходящих соседей из API meshcoretel.ru
+      (пассивно, без отправки сообщений в каналы)
+    - Опция --repeater: префикс ретранслятора для поиска через API
+    - Опция --bots: поиск исходящих соседей через ответы ботов (старый метод)
+    - API-опрос в отдельном потоке (не блокирует обработку серийного порта)
+    - В verbose (-v) пакеты из API помечаются [API] голубым цветом
   v1.2 — Переподключение, сохранение статистики, CLI
     - Автоматическое переподключение при потере USB-соединения
     - Сохранение статистики в файл meshcore-stats.json между запусками
@@ -10,11 +23,9 @@ Changelog:
     - Опция -p/--port для указания серийного порта
     - Опция --hops (вместо -p/--path) для рекорда хопов
     - Фоновое чтение порта через отдельный поток (без потери пакетов)
-    - Связь с meshcore-probe для автоматического зондирования каналов
   v1.1 — Дешифрование каналов, исходящие соседи
     - Расшифровка групповых сообщений (GRP_TXT/GRP_DATA) публичных каналов (AES-128-ECB)
-    - Таблица исходящих соседей (-n): кто ретранслирует наши исходящие пакеты
-      (паттерны: "Found N unique path(s):" и сообщения от AetherByte🤖)
+    - Таблица исходящих соседей (-n) через ответы ботов в каналах
     - В verbose (-v) сообщения с исходящим path выделяются магентой
     - Столбцы ->RPT/->OBS в таблице входящих соседей вместо бесполезного SNR
     - Зависимость: pycryptodome (опционально)
@@ -26,7 +37,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '1.2'
+__version__ = '2.1'
 
 import serial
 import time
@@ -98,6 +109,9 @@ KNOWN_CHANNEL_NAMES = [
 VERBOSE = False
 # Режим поиска исходящих соседей через ботов в каналах (включается через --bots).
 BOTS_MODE = False
+# Режим отладки: подсветка и логирование пакетов, принятых observer напрямую (-d).
+DEBUG_MODE = False
+DEBUG_LOG = 'meshcore-debug.log'
 
 # ========== MESHCORE PROTOCOL ==========
 # Маппинг типов пакетов (payload type, биты 2-5 заголовка)
@@ -274,6 +288,20 @@ def parse_raw(hex_str):
         path = [f"{b:02X}" for b in data[offset:offset + path_length]]
         payload = data[offset + path_length:]
 
+        # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix
+        dest = None
+        if route_type in (0x02, 0x03) and len(payload) >= 6:
+            dest = payload[:6].hex().upper()
+
+        # TRACE-пакеты: path содержит SNR (×4) на каждом хопе, а не узлы;
+        # маршрут трассировки — в конце payload (после dest[6] + meta[3])
+        trace_route = None
+        trace_snr = None
+        if payload_type == 0x09 and route_type in (0x02, 0x03):
+            trace_snr = [b / 4.0 for b in data[offset:offset + path_length]]
+            if len(payload) > 9:
+                trace_route = [f"{b:02X}" for b in payload[9:]]
+
         return {
             'route_type': route_type,
             'payload_type': payload_type,
@@ -282,6 +310,9 @@ def parse_raw(hex_str):
             'path_length': path_length,
             'path': path,
             'payload': payload,
+            'dest': dest,
+            'trace_route': trace_route,
+            'trace_snr': trace_snr,
         }
     except (ValueError, IndexError):
         return None
@@ -516,10 +547,41 @@ def parse_line(line, stats, debug):
                     for out_nb in outgoing_nbs:
                         outgoing_stats[out_nb]['total'] += 1
 
+            # Определяем соседа — кто доставил пакет ретранслятору или наблюдателю.
+            # Только для FLOOD-пакетов (DIRECT маршрутизируются по заданному пути).
+            _last_raw_neighbor = None
+            direct_to_obs = False
+            is_flood = parsed['route_type'] in (0x00, 0x01)
+            if is_flood and parsed['path']:
+                last = parsed['path'][-1]
+                if last.startswith(REPEATER_PREFIX):
+                    if len(parsed['path']) >= 2:
+                        nb = parsed['path'][-2]
+                        neighbor_stats[nb]['rpt'] += 1
+                        neighbor_stats[nb]['total'] += 1
+                        _last_raw_neighbor = nb
+                else:
+                    neighbor_stats[last]['obs'] += 1
+                    neighbor_stats[last]['total'] += 1
+                    _last_raw_neighbor = last
+                    direct_to_obs = True
+
             if VERBOSE:
-                color = f"{MAGENTA}{BOLD}" if outgoing_nbs else ""
-                end = RESET if outgoing_nbs else ""
-                print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{end}", flush=True)
+                if outgoing_nbs:
+                    color, end = f"{MAGENTA}{BOLD}", RESET
+                elif direct_to_obs:
+                    color, end = f"{YELLOW}{BOLD}", RESET
+                else:
+                    color, end = "", ""
+                obs_tag = f" {YELLOW}[OBS]{RESET}{color}" if direct_to_obs else ""
+
+                if parsed.get('trace_route') is not None:
+                    route_str = '→'.join(parsed['trace_route']) if parsed['trace_route'] else '?'
+                    snr_str = ','.join(f"{s:.1f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
+                    print(f"    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]", flush=True)
+                else:
+                    dest_tag = f" -> {parsed['dest']}" if parsed.get('dest') else ""
+                    print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{dest_tag}{obs_tag}{end}", flush=True)
                 if decrypted:
                     text = decrypted['text']
                     if ': ' in text:
@@ -532,40 +594,34 @@ def parse_line(line, stats, debug):
                 if outgoing_nbs:
                     print(f"{MAGENTA}       ^^^ бот: исходящий сосед: {','.join(outgoing_nbs)}{RESET}", flush=True)
 
-            # Обновляем счётчик хопов в статистике для каждого узла в path
-            for node_hash in parsed['path']:
-                stats[node_hash].setdefault('hops_seen', 0)
-                stats[node_hash]['hops_seen'] += 1
+            if direct_to_obs and DEBUG_MODE:
+                pkt_time = line.split(' U RAW:')[0].strip() if ' U RAW:' in line else '?'
+                dest_info = f" -> {parsed['dest']}" if parsed.get('dest') else ""
+                dec_info = ""
+                if decrypted:
+                    dec_info = f" | {decrypted['channel']}: {decrypted['text']}"
+                log_line = f"{pkt_time} | {pkt_label} | hops={hops} path=[{path_str}]{dest_info} | ->OBS via {last}{dec_info}\n"
+                with open(DEBUG_LOG, 'a') as f:
+                    f.write(log_line)
 
-            # Обновляем рекорд максимальных хопов
-            # Извлекаем timestamp из строки лога (формат: "HH:MM:SS - DD/M/YYYY U RAW:")
-            pkt_time = line.split(' U RAW:')[0].strip() if ' U RAW:' in line else '?'
-            if max_hops_record is None or hops > max_hops_record['hops']:
-                max_hops_record = {
-                    'time': pkt_time,
-                    'hops': hops,
-                    'path': parsed['path'],
-                    'route_name': parsed['route_name'],
-                    'payload_name': parsed['payload_name'],
-                    'payload_type': parsed['payload_type'],
-                    'payload': parsed['payload'],
-                }
+            # TRACE-пакеты: path содержит SNR, не узлы — пропускаем статистику
+            is_trace = parsed.get('trace_route') is not None
+            if not is_trace:
+                for node_hash in parsed['path']:
+                    stats[node_hash].setdefault('hops_seen', 0)
+                    stats[node_hash]['hops_seen'] += 1
 
-            # Определяем соседа — кто доставил пакет ретранслятору или наблюдателю.
-            # Сохраняем в _last_raw_neighbor для корреляции с SNR из следующей RX-строки.
-            _last_raw_neighbor = None
-            if parsed['path']:
-                last = parsed['path'][-1]
-                if last.startswith(REPEATER_PREFIX):
-                    if len(parsed['path']) >= 2:
-                        nb = parsed['path'][-2]
-                        neighbor_stats[nb]['rpt'] += 1
-                        neighbor_stats[nb]['total'] += 1
-                        _last_raw_neighbor = nb
-                else:
-                    neighbor_stats[last]['obs'] += 1
-                    neighbor_stats[last]['total'] += 1
-                    _last_raw_neighbor = last
+                pkt_time = line.split(' U RAW:')[0].strip() if ' U RAW:' in line else '?'
+                if max_hops_record is None or hops > max_hops_record['hops']:
+                    max_hops_record = {
+                        'time': pkt_time,
+                        'hops': hops,
+                        'path': parsed['path'],
+                        'route_name': parsed['route_name'],
+                        'payload_name': parsed['payload_name'],
+                        'payload_type': parsed['payload_type'],
+                        'payload': parsed['payload'],
+                    }
 
             # Сохраняем примеры распарсенных RAW для диагностики
             if debug['raw_lines'] <= 3:
@@ -1043,6 +1099,8 @@ def _connect_and_run(args, port, cycle_counter):
             print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
         if args.api:
             print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+        if DEBUG_MODE:
+            print(f"Отладка ->OBS: пакеты пишутся в {DEBUG_LOG}")
         print(flush=True)
         time.sleep(2)
 
@@ -1194,11 +1252,15 @@ if __name__ == "__main__":
     parser.add_argument('--bots', action='store_true',
                         help='Определять исходящих соседей из ответов ботов в каналах '
                              '(требует отправки p/mt через meshcore-probe)')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Логировать пакеты, принятые observer напрямую (->OBS), '
+                             f'в файл {DEBUG_LOG}')
     parser.add_argument('--reset', action='store_true',
                         help='Сбросить сохранённую статистику и начать с нуля')
     args = parser.parse_args()
     VERBOSE = args.verbose
     BOTS_MODE = args.bots
+    DEBUG_MODE = args.debug
     if args.api and not args.neighbors:
         args.neighbors = True
     # Если ни один режим вывода не указан, показываем оригинальную статистику
@@ -1206,9 +1268,12 @@ if __name__ == "__main__":
         args.original = True
     # Загрузка или сброс статистики
     if args.reset:
-        if os.path.exists(STATS_FILE):
-            os.remove(STATS_FILE)
-            print("Статистика сброшена")
+        removed = []
+        for f in (STATS_FILE, DEBUG_LOG):
+            if os.path.exists(f):
+                os.remove(f)
+                removed.append(os.path.basename(f))
+        print(f"Сброшено: {', '.join(removed)}" if removed else "Нечего сбрасывать")
     else:
         load_stats()
     main(args)

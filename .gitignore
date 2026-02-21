@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 meshcore-stats.json
+meshcore-debug.log
 .DS_Store
