@@ -2,6 +2,8 @@
 
 Анализатор пакетов для [MeshCore](https://github.com/meshcore-dev/MeshCore) Observer. Подключается к ноде Room Server по серийному порту, в реальном времени читает радиопакеты и выводит статистику по узлам mesh-сети.
 
+**Версия 3.0** — поддержка маршрутов с 2 байтами на хоп (прошивки Meshcore 1.14+).
+
 ## Возможности
 
 - **Исходящие соседи через API** — получение данных из [MeshCoreTel](https://meshcoretel.ru) без отправки сообщений в каналы (`--api`)
@@ -14,7 +16,7 @@
 - **Дешифрование каналов** — расшифровка групповых сообщений (GRP_TXT/GRP_DATA) публичных каналов (AES-128-ECB)
 - **Автоматическое переподключение** — при потере USB-соединения ждёт возвращения порта и продолжает работу
 - **Сохранение статистики** — накопленные данные сохраняются в `meshcore-stats.json` между запусками
-- **Декодирование RAW-пакетов** — парсинг заголовка MeshCore v1: route type, payload type, path
+- **Декодирование RAW-пакетов** — парсинг заголовка MeshCore v1: route type, payload type, path (1 или 2 байта на хоп для 1.14+)
 - **Цветовая раскраска** — свои ноды, ретрансляторы, broadcast, ->OBS и исходящие соседи визуально различаются
 
 ## Требования
@@ -40,6 +42,8 @@ uv pip install pyserial pycryptodome
 PORT = '/dev/cu.usbmodemXXXX'   # серийный порт ноды (ls /dev/cu.usb*)
 NODE_PREFIX = '10'               # префикс hex-адресов ваших нод-компаньонов
 REPEATER_PREFIX = '33'           # префикс hex-адресов ваших ретрансляторов
+PATH_BYTES_PER_HOP = 1          # 1 — до 1.14, 2 — режим маршрутов 1.14+ (2 байта на хоп)
+MY_COMPANIONS = ['Kopcap V4️⃣', 'Kopcap 1️⃣1️⃣4️⃣']  # имена компаньонов для ack@/@ маршрутов
 CYCLE_TIME = 60                  # интервал вывода статистики (секунды)
 
 # Известные публичные каналы для расшифровки
@@ -110,9 +114,9 @@ uv run meshcore-analyzer.py --reset
 [header 1B][transport_codes 4B (опц.)][path_length 1B][path NB][payload]
 ```
 
-Поддерживаемые типы пакетов: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT, GRP_DATA, ANON_REQ, PATH, TRACE, MULTIPART, CONTROL.
-
-Для TRACE-пакетов поле path содержит не узлы, а измерения SNR (×4) на каждом хопе маршрута трассировки.
+- **path**: при `PATH_BYTES_PER_HOP=1` — по 1 байту на хоп (до 1.14); при `PATH_BYTES_PER_HOP=2` (1.14+) — по 2 байта на хоп. Число хопов = длина path в байтах / PATH_BYTES_PER_HOP.
+- Поддерживаемые типы пакетов: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT, GRP_DATA, ANON_REQ, PATH, TRACE, MULTIPART, CONTROL.
+- Для TRACE-пакетов поле path содержит не узлы, а измерения SNR (×4) на каждом хопе; маршрут трассировки в payload с тем же размером хопа (1 или 2 байта).
 
 ## Лицензия
 

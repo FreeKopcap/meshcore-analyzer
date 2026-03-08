@@ -1,8 +1,14 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 2.2
+Version: 3.0
 
 Changelog:
+  v3.0 — Поддержка маршрутов 2 байта на хоп (Meshcore 1.14+)
+    - Константа PATH_BYTES_PER_HOP (1 или 2): режим парсинга path и TRACE
+    - Парсинг path/trace_route при 2 байтах на хоп; число хопов = len(path)
+    - Исходящие соседи из ответов ботов: ack@[имя] и @[имя] (оба формата)
+    - MY_COMPANIONS: имена компаньонов для маршрутов без префикса репитера
+    - Регулярки в extract_outgoing_neighbors поддерживают 2 и 4 hex на хоп
   v2.2 — SNR соседей из TRACE, полный debug-лог
     - Столбцы SNR→/SNR← в таблице соседей (средний SNR туда/обратно из TRACE)
     - TRACE-ответы учитываются в таблицах соседей и исходящих соседей
@@ -42,7 +48,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '2.2'
+__version__ = '3.0'
 
 import serial
 import time
@@ -77,7 +83,8 @@ BOLD = '\033[1m'
 # Серийный порт, к которому подключена нода Meshcore.
 # macOS: обычно /dev/cu.usbmodemXXXX или /dev/cu.usbserial-XXXX
 # Windows: COM24, COM3 и т.д.
-PORT = '/dev/cu.usbmodemE8F60ACB1A401'
+# PORT = '/dev/cu.usbmodemE8F60ACB1A401'    # коричневый корпус
+PORT = '/dev/cu.usbmodemE8F60ACB19781'      # черный корпус
 BAUDRATE = 115200
 
 # Префикс hex-адресов ваших нод-компаньонов. Подсвечиваются зелёным в таблице.
@@ -85,11 +92,19 @@ NODE_PREFIX = '10'
 # Префикс hex-адресов ваших ретрансляторов. Подсвечиваются голубым.
 REPEATER_PREFIX = '33'
 
+# Байт на хоп в маршруте (1 — до прошивки 1.14, 2 — режим Meshcore 1.14+).
+# При 2: path_length в пакете = байты пути, число хопов = path_length // 2;
+# REPEATER_PREFIX/NODE_PREFIX лучше задавать полным 2-байтным hex (4 символа).
+PATH_BYTES_PER_HOP = 1
+
 # Виртуальный адрес для пакетов без конкретного источника (широковещательные).
 BROADCAST_NODE = 'BCAST'
 
 # Имя бота, передающего маршруты в формате "XX: Описание репитера" (паттерн 2).
 PATHBOT_SENDER = 'AetherByte\U0001f916'  # AetherByte🤖
+
+# Имена ваших компаньонов для обработки ack@[...] без префикса репитера.
+MY_COMPANIONS = ['Kopcap V4️⃣', 'Kopcap 1️⃣1️⃣4️⃣']
 
 # Интервал между циклами сбора статистики (секунды).
 CYCLE_TIME = 60
@@ -116,7 +131,7 @@ VERBOSE = False
 BOTS_MODE = False
 # Режим отладки: подсветка и логирование пакетов, принятых observer напрямую (-d).
 DEBUG_MODE = False
-DEBUG_LOG = 'meshcore-debug.log'
+DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'meshcore-debug.log')
 
 # ========== MESHCORE PROTOCOL ==========
 # Маппинг типов пакетов (payload type, биты 2-5 заголовка)
@@ -177,6 +192,8 @@ neighbor_stats = defaultdict(lambda: {
     'trace_out_count': 0,
     'trace_in_sum': 0,     # SNR← (сосед → репитер, из TRACE)
     'trace_in_count': 0,
+    'trace_attempts': 0,   # Попыток трассировки
+    'trace_ok': 0,         # Успешных (полный ответ)
 })
 
 # Статистика исходящих соседей (из расшифрованных групповых сообщений с path).
@@ -267,8 +284,9 @@ def parse_raw(hex_str):
 
     Returns:
         dict с полями: route_type, payload_type, route_name, payload_name,
-                       path_length, path (список hex-адресов хопов),
-                       payload (bytes сырых данных payload), или None при ошибке
+                       path_length (байт в пути), path (список хопов;
+                       при PATH_BYTES_PER_HOP==2 элемент — 4 hex),
+                       payload (bytes), или None при ошибке
     """
     try:
         data = bytes.fromhex(hex_str)
@@ -292,7 +310,16 @@ def parse_raw(hex_str):
         if offset + path_length > len(data):
             return None
 
-        path = [f"{b:02X}" for b in data[offset:offset + path_length]]
+        # Маршрут: 1 байт на хоп (до 1.14) или 2 байта на хоп (1.14+)
+        bp = PATH_BYTES_PER_HOP
+        if bp == 1:
+            path = [f"{b:02X}" for b in data[offset:offset + path_length]]
+        else:
+            path = [
+                (data[offset + i : offset + i + bp].hex().upper())
+                for i in range(0, path_length, bp)
+                if offset + i + bp <= len(data)
+            ]
         payload = data[offset + path_length:]
 
         # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix
@@ -305,10 +332,19 @@ def parse_raw(hex_str):
         trace_route = None
         trace_snr = None
         if payload_type == 0x09 and route_type in (0x02, 0x03):
+            # SNR: по одному байту на хоп
             trace_snr = [(b - 256 if b > 127 else b) / 4.0
                          for b in data[offset:offset + path_length]]
             if len(payload) > 9:
-                trace_route = [f"{b:02X}" for b in payload[9:]]
+                raw_route = payload[9:]
+                if PATH_BYTES_PER_HOP == 1:
+                    trace_route = [f"{b:02X}" for b in raw_route]
+                else:
+                    trace_route = [
+                        raw_route[i : i + PATH_BYTES_PER_HOP].hex().upper()
+                        for i in range(0, len(raw_route), PATH_BYTES_PER_HOP)
+                        if i + PATH_BYTES_PER_HOP <= len(raw_route)
+                    ]
 
         return {
             'route_type': route_type,
@@ -388,32 +424,48 @@ def extract_outgoing_neighbors(text):
     """
     neighbors = []
 
-    # Паттерн 1: "Found N unique path(s):" + строки "XX,YY,ZZ,..."
+    # Паттерн 1: "Found N unique path(s):" + строки "XX,YY,..." или "XXXX,YYYY,..." (1.14)
+    # Один хоп = 2 hex (1 байт) или 4 hex (2 байта)
+    hop_hex = r'[\da-fA-F]{2}' if PATH_BYTES_PER_HOP == 1 else r'[\da-fA-F]{4}'
+    re_line = re.compile(r'^' + hop_hex + r'(,' + hop_hex + r')+$')
     parts = re.split(r'Found \d+ unique path\(s\):\s*', text)
     for part in parts[1:]:
         for line in part.split('\n'):
-            line = line.strip()
-            if re.match(r'^[\da-fA-F]{1,2}(,[\da-fA-F]{1,2})+$', line):
+            line = line.strip().replace(' ', '')
+            if re_line.match(line):
                 hops = [h.strip().upper() for h in line.split(',')]
                 if len(hops) >= 2 and hops[0].startswith(REPEATER_PREFIX.upper()):
                     neighbors.append(hops[1])
             else:
                 break
 
-    # Паттерн 2: сообщения от PATHBOT_SENDER в формате "XX: Описание\nYY: Описание\n..."
+    # Паттерн 2: сообщения от PATHBOT_SENDER "XX: Описание" или "XXXX: Описание" (1.14)
+    hex_prefix = r'[0-9a-fA-F]{2}' if PATH_BYTES_PER_HOP == 1 else r'[0-9a-fA-F]{4}'
     sender_prefix = PATHBOT_SENDER + ': '
     if text.startswith(sender_prefix):
         msg = text[len(sender_prefix):]
         lines = msg.split('\n')
-        # Если первая строка начинается с "..." — это продолжение, игнорируем
         if lines and not lines[0].strip().startswith('...'):
             prefixes = []
             for line in lines:
-                m = re.match(r'^([0-9a-fA-F]{2}):\s', line.strip())
+                m = re.match(r'^(' + hex_prefix + r'):\s', line.strip())
                 if m:
                     prefixes.append(m.group(1).upper())
             if len(prefixes) >= 2 and prefixes[0].startswith(REPEATER_PREFIX.upper()):
                 neighbors.append(prefixes[1])
+
+    # Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX, YY,..." (2 или 4 hex на хоп для 1.14)
+    # Если путь начинается с REPEATER_PREFIX — берём второй хоп.
+    # Если нет, но имя компаньона в MY_COMPANIONS — первый хоп (репитер
+    # считается дублем, компаньон услышал соседа напрямую).
+    m = re.search(r'(?:ack)?@\[(.*?)\]\s+([\da-fA-F]{2,4}(?:,\s*[\da-fA-F]{2,4})+)', text)
+    if m:
+        name = m.group(1)
+        hops = [h.strip().upper() for h in m.group(2).split(',')]
+        if len(hops) >= 2 and hops[0].startswith(REPEATER_PREFIX.upper()):
+            neighbors.append(hops[1])
+        elif hops and name in MY_COMPANIONS:
+            neighbors.append(hops[0])
 
     return neighbors
 
@@ -543,7 +595,7 @@ def parse_line(line, stats, debug):
         if parsed:
             pkt_label = f"{parsed['route_name']} {parsed['payload_name']}"
             path_str = ','.join(parsed['path']) if parsed['path'] else '-'
-            hops = parsed['path_length']
+            hops = len(parsed['path'])
 
             # Расшифровка групповых сообщений
             decrypted = None
@@ -572,19 +624,22 @@ def parse_line(line, stats, debug):
                     _last_raw_neighbor = last
                     direct_to_obs = True
 
-            # TRACE: собираем SNR→/SNR← и считаем соседа (входящего + исходящего)
-            if parsed.get('trace_snr') and parsed.get('trace_route'):
+            # TRACE: собираем SNR→/SNR←, считаем попытки/успехи
+            if parsed.get('trace_route') is not None:
                 tr = parsed['trace_route']
-                ts = parsed['trace_snr']
+                ts = parsed.get('trace_snr') or []
                 if (len(tr) >= 3
-                        and tr[0].upper().startswith(REPEATER_PREFIX.upper())
-                        and len(ts) >= 2):
+                        and tr[0].upper().startswith(REPEATER_PREFIX.upper())):
                     nb = tr[1].upper()
-                    neighbor_stats[nb]['total'] += 1
-                    neighbor_stats[nb]['trace_out_sum'] += ts[1]
-                    neighbor_stats[nb]['trace_out_count'] += 1
-                    outgoing_stats[nb]['total'] += 1
+                    if len(ts) == 0:
+                        neighbor_stats[nb]['trace_attempts'] += 1
+                    if len(ts) >= 2:
+                        neighbor_stats[nb]['total'] += 1
+                        neighbor_stats[nb]['trace_out_sum'] += ts[1]
+                        neighbor_stats[nb]['trace_out_count'] += 1
+                        outgoing_stats[nb]['total'] += 1
                     if len(ts) >= len(tr):
+                        neighbor_stats[nb]['trace_ok'] += 1
                         neighbor_stats[nb]['trace_in_sum'] += ts[-1]
                         neighbor_stats[nb]['trace_in_count'] += 1
 
@@ -600,7 +655,7 @@ def parse_line(line, stats, debug):
                 if parsed.get('trace_route') is not None:
                     route_str = '→'.join(parsed['trace_route']) if parsed['trace_route'] else '?'
                     snr_str = ','.join(f"{s:.2f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
-                    print(f"    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]", flush=True)
+                    print(f"{CYAN}    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]{RESET}", flush=True)
                 else:
                     dest_tag = f" -> {parsed['dest']}" if parsed.get('dest') else ""
                     print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{dest_tag}{obs_tag}{end}", flush=True)
@@ -926,7 +981,7 @@ def print_neighbors(cycle_info):
     sorted_neighbors = sorted(neighbor_stats.items(), key=lambda x: x[1]['total'], reverse=True)
     grand_total = sum(d['total'] for d in neighbor_stats.values())
 
-    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6} {'SNR→':>7} {'SNR←':>7}")
+    print(f"{'Сосед':<8} {'Пакетов':>8} {'%':>6} {'SNR→':>7} {'SNR←':>7} {'Trace':>7}")
     print("-" * 70)
 
     for node, data in sorted_neighbors:
@@ -934,8 +989,10 @@ def print_neighbors(cycle_info):
 
         snr_out = f"{data['trace_out_sum'] / data['trace_out_count']:.2f}" if data.get('trace_out_count') else "-"
         snr_in = f"{data['trace_in_sum'] / data['trace_in_count']:.2f}" if data.get('trace_in_count') else "-"
+        attempts = data.get('trace_attempts', 0)
+        trace_col = f"{data.get('trace_ok', 0)}/{attempts}" if attempts else "-"
 
-        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {snr_out:>7} {snr_in:>7}"
+        base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {snr_out:>7} {snr_in:>7} {trace_col:>7}"
 
         if node.startswith(REPEATER_PREFIX):
             print(f"{CYAN}{base_line}{RESET}")
@@ -1140,8 +1197,11 @@ def _connect_and_run(args, port, cycle_counter):
         time.sleep(2)
 
         send_cmd(ser, "log start")
-        print("Логирование включено", flush=True)
         time.sleep(1)
+        # Диагностика: проверяем, отвечает ли порт
+        waiting = ser.in_waiting
+        test_line = ser.readline().decode('utf-8', errors='ignore').strip() if waiting else ''
+        print(f"Логирование включено (буфер: {waiting} байт, ответ: '{test_line}')", flush=True)
 
         line_queue = queue.Queue()
         reader_thread = threading.Thread(
@@ -1171,15 +1231,24 @@ def _connect_and_run(args, port, cycle_counter):
                 )
                 api_thread.start()
 
+            last_data_time = time.time()
             while time.time() - cycle_start < CYCLE_TIME:
                 if error_event.is_set():
                     raise serial.SerialException("Устройство отключено")
                 try:
                     line = line_queue.get(timeout=0.1)
                     lines_read += 1
+                    last_data_time = time.time()
                     parse_line(line, stats, debug)
                 except queue.Empty:
-                    pass
+                    if time.time() - last_data_time > 1800:
+                        try:
+                            ser.write(b"log start\r\n")
+                        except (serial.SerialException, OSError):
+                            raise serial.SerialException("Порт отключён")
+                        last_data_time = time.time()
+                        if VERBOSE:
+                            print(f"  {YELLOW}[!] нет данных 30 мин, переотправка log start{RESET}", flush=True)
 
             cycle_info = {
                 'num': cycle_counter[0],
@@ -1198,7 +1267,7 @@ def _connect_and_run(args, port, cycle_counter):
 
             save_stats()
 
-    except serial.SerialException as e:
+    except (serial.SerialException, OSError) as e:
         save_stats()
         print(f"\n{YELLOW}Потеря соединения: {e}{RESET}", flush=True)
         return True
