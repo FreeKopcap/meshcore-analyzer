@@ -1,8 +1,11 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.0
+Version: 3.1
 
 Changelog:
+  v3.1 — Нейтральный к USB API-поллер
+    - Поллер MeshCoreTel (`--api`) работает в отдельном потоке, независимо от USB
+    - При потере USB скрипт ждёт переподключения порта, но продолжает обновлять исходящих соседей через API
   v3.0 — Поддержка маршрутов 2 байта на хоп (Meshcore 1.14+)
     - Константа PATH_BYTES_PER_HOP (1 или 2): режим парсинга path и TRACE
     - Парсинг path/trace_route при 2 байтах на хоп; число хопов = len(path)
@@ -48,7 +51,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '3.0'
+__version__ = '3.1'
 
 import serial
 import time
@@ -79,6 +82,20 @@ RESET = '\033[0m'
 BOLD = '\033[1m'
 # ===============================================================
 
+
+def is_repeater_token(token: str) -> bool:
+    """Возвращает True, если токен в path относится к вашему репитеру.
+
+    Логика:
+      - начинается с REPEATER_PREFIX (обычный случай);
+      - или состоит только из повторяющихся байт 0x33: 33,3333,333333,...
+    """
+    t = token.upper()
+    if t.startswith(REPEATER_PREFIX.upper()):
+        return True
+    # Повторяющиеся "33" (любая длина, кратная 2)
+    return len(t) >= 2 and len(t) % 2 == 0 and all(t[i:i+2] == '33' for i in range(0, len(t), 2))
+
 # ========== КОНФИГУРАЦИЯ ==========
 # Серийный порт, к которому подключена нода Meshcore.
 # macOS: обычно /dev/cu.usbmodemXXXX или /dev/cu.usbserial-XXXX
@@ -92,9 +109,11 @@ NODE_PREFIX = '10'
 # Префикс hex-адресов ваших ретрансляторов. Подсвечиваются голубым.
 REPEATER_PREFIX = '33'
 
-# Байт на хоп в маршруте (1 — до прошивки 1.14, 2 — режим Meshcore 1.14+).
-# При 2: path_length в пакете = байты пути, число хопов = path_length // 2;
-# REPEATER_PREFIX/NODE_PREFIX лучше задавать полным 2-байтным hex (4 символа).
+# Байт на хоп в маршруте (1 — текущие прошивки; 2 — режим Meshcore 1.14+).
+# В логах Observer путь приходит как последовательность байт; адрес ретранслятора
+# может занимать 1, 2 или 3 байта. Для вашего репитера используется ключ
+# вида 33 33 33 ... (любая длина). В анализаторе хопы остаются побайтно, но
+# репитер определяется по префиксу REPEATER_PREFIX ИЛИ по маске (33)+.
 PATH_BYTES_PER_HOP = 1
 
 # Виртуальный адрес для пакетов без конкретного источника (широковещательные).
@@ -310,16 +329,10 @@ def parse_raw(hex_str):
         if offset + path_length > len(data):
             return None
 
-        # Маршрут: 1 байт на хоп (до 1.14) или 2 байта на хоп (1.14+)
-        bp = PATH_BYTES_PER_HOP
-        if bp == 1:
-            path = [f"{b:02X}" for b in data[offset:offset + path_length]]
-        else:
-            path = [
-                (data[offset + i : offset + i + bp].hex().upper())
-                for i in range(0, path_length, bp)
-                if offset + i + bp <= len(data)
-            ]
+        # Маршрут: пока парсим побайтно; прошивки могут использовать 1/2/3 байта
+        # на адрес, но в логе Observer path приходит как сырые байты. В дальнейшем
+        # можно группировать байты по PATH_BYTES_PER_HOP, сейчас оставляем по 1.
+        path = [f"{b:02X}" for b in data[offset:offset + path_length]]
         payload = data[offset + path_length:]
 
         # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix
@@ -336,15 +349,9 @@ def parse_raw(hex_str):
             trace_snr = [(b - 256 if b > 127 else b) / 4.0
                          for b in data[offset:offset + path_length]]
             if len(payload) > 9:
+                # Маршрут трассировки — тоже побайтно; адреса могут быть 1–3 байта.
                 raw_route = payload[9:]
-                if PATH_BYTES_PER_HOP == 1:
-                    trace_route = [f"{b:02X}" for b in raw_route]
-                else:
-                    trace_route = [
-                        raw_route[i : i + PATH_BYTES_PER_HOP].hex().upper()
-                        for i in range(0, len(raw_route), PATH_BYTES_PER_HOP)
-                        if i + PATH_BYTES_PER_HOP <= len(raw_route)
-                    ]
+                trace_route = [f"{b:02X}" for b in raw_route]
 
         return {
             'route_type': route_type,
@@ -434,7 +441,7 @@ def extract_outgoing_neighbors(text):
             line = line.strip().replace(' ', '')
             if re_line.match(line):
                 hops = [h.strip().upper() for h in line.split(',')]
-                if len(hops) >= 2 and hops[0].startswith(REPEATER_PREFIX.upper()):
+                if len(hops) >= 2 and is_repeater_token(hops[0]):
                     neighbors.append(hops[1])
             else:
                 break
@@ -451,7 +458,7 @@ def extract_outgoing_neighbors(text):
                 m = re.match(r'^(' + hex_prefix + r'):\s', line.strip())
                 if m:
                     prefixes.append(m.group(1).upper())
-            if len(prefixes) >= 2 and prefixes[0].startswith(REPEATER_PREFIX.upper()):
+            if len(prefixes) >= 2 and is_repeater_token(prefixes[0]):
                 neighbors.append(prefixes[1])
 
     # Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX, YY,..." (2 или 4 hex на хоп для 1.14)
@@ -462,7 +469,7 @@ def extract_outgoing_neighbors(text):
     if m:
         name = m.group(1)
         hops = [h.strip().upper() for h in m.group(2).split(',')]
-        if len(hops) >= 2 and hops[0].startswith(REPEATER_PREFIX.upper()):
+        if len(hops) >= 2 and is_repeater_token(hops[0]):
             neighbors.append(hops[1])
         elif hops and name in MY_COMPANIONS:
             neighbors.append(hops[0])
@@ -614,7 +621,7 @@ def parse_line(line, stats, debug):
             is_flood = parsed['route_type'] in (0x00, 0x01)
             if is_flood and parsed['path']:
                 last = parsed['path'][-1]
-                if last.startswith(REPEATER_PREFIX):
+                if is_repeater_token(last):
                     if len(parsed['path']) >= 2:
                         nb = parsed['path'][-2]
                         neighbor_stats[nb]['total'] += 1
@@ -628,8 +635,7 @@ def parse_line(line, stats, debug):
             if parsed.get('trace_route') is not None:
                 tr = parsed['trace_route']
                 ts = parsed.get('trace_snr') or []
-                if (len(tr) >= 3
-                        and tr[0].upper().startswith(REPEATER_PREFIX.upper())):
+                if (len(tr) >= 3 and is_repeater_token(tr[0].upper())):
                     nb = tr[1].upper()
                     if len(ts) == 0:
                         neighbor_stats[nb]['trace_attempts'] += 1
@@ -804,7 +810,7 @@ def print_stats(stats, cycle_info, debug):
         # Цветовая раскраска: ноды — зелёным, ретрансляторы — голубым, broadcast — жёлтым
         if node == BROADCAST_NODE:
             print(f"{YELLOW}{BOLD}{base_line}{RESET}")
-        elif node.startswith(REPEATER_PREFIX):
+        elif is_repeater_token(node):
             print(f"{CYAN}{base_line}{RESET}")
         elif node.startswith(NODE_PREFIX):
             print(f"{GREEN}{base_line}{RESET}")
@@ -994,7 +1000,7 @@ def print_neighbors(cycle_info):
 
         base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}% {snr_out:>7} {snr_in:>7} {trace_col:>7}"
 
-        if node.startswith(REPEATER_PREFIX):
+        if is_repeater_token(node):
             print(f"{CYAN}{base_line}{RESET}")
         elif node.startswith(NODE_PREFIX):
             print(f"{GREEN}{base_line}{RESET}")
@@ -1128,15 +1134,18 @@ def fetch_outgoing_from_api(repeater_prefix):
     return found
 
 
-def _api_poller(repeater_prefix, stop_event, duration):
-    """Фоновый поток: периодически опрашивает API MeshCoreTel в течение цикла."""
+def _api_poller(repeater_prefix, stop_event):
+    """Фоновый поток: периодически опрашивает API MeshCoreTel, пока не попросят остановиться.
+
+    Работает независимо от состояния USB-порта: даже при потере Observer
+    продолжает обновлять outgoing_stats через MeshCoreTel.
+    """
     poll_interval = 15
-    deadline = time.time() + duration
-    while not stop_event.is_set() and time.time() < deadline:
+    while not stop_event.is_set():
         fetch_outgoing_from_api(repeater_prefix)
         # Спим интервал, но проверяем stop_event каждую секунду
         for _ in range(poll_interval):
-            if stop_event.is_set() or time.time() >= deadline:
+            if stop_event.is_set():
                 return
             time.sleep(1)
 
@@ -1223,14 +1232,6 @@ def _connect_and_run(args, port, cycle_counter):
             lines_read = 0
             cycle_start = time.time()
 
-            if args.api:
-                api_thread = threading.Thread(
-                    target=_api_poller,
-                    args=(args.repeater, stop_event, CYCLE_TIME),
-                    daemon=True
-                )
-                api_thread.start()
-
             last_data_time = time.time()
             while time.time() - cycle_start < CYCLE_TIME:
                 if error_event.is_set():
@@ -1283,11 +1284,27 @@ def _connect_and_run(args, port, cycle_counter):
 
 
 def main(args):
-    """Главный цикл работы анализатора с автоматическим переподключением."""
+    """Главный цикл работы анализатора с автоматическим переподключением.
+
+    USB-часть (Observer по серийному порту) и API MeshCoreTel работают независимо:
+    при потере USB API-прослушка продолжает обновлять исходящих соседей.
+    """
     port = args.port
     cycle_counter = [0]
 
+    api_stop_event = threading.Event() if args.api else None
+    api_thread = None
+
     try:
+        # Глобальный API-поллер, не зависящий от состояния USB-порта
+        if args.api:
+            api_thread = threading.Thread(
+                target=_api_poller,
+                args=(args.repeater, api_stop_event),
+                daemon=True,
+            )
+            api_thread.start()
+
         while True:
             if not os.path.exists(port):
                 print(f"Порт {port} не найден. Ожидание подключения...", flush=True)
@@ -1298,7 +1315,10 @@ def main(args):
             if not need_reconnect:
                 break
 
-            print(f"Ожидание переподключения к {port}...", flush=True)
+            if args.api:
+                print(f"Ожидание переподключения к {port}... (API продолжает работать)", flush=True)
+            else:
+                print(f"Ожидание переподключения к {port}...", flush=True)
             _wait_for_port(port)
             time.sleep(2)
 
@@ -1320,6 +1340,12 @@ def main(args):
         if args.hops:
             print_max_hops(cycle_info)
         save_stats()
+    finally:
+        # Аккуратно останавливаем глобальный API-поток
+        if api_stop_event is not None:
+            api_stop_event.set()
+        if api_thread is not None:
+            api_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
