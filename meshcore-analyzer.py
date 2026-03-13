@@ -1,11 +1,14 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.1
+Version: 3.2
 
 Changelog:
-  v3.1 — Нейтральный к USB API-поллер
-    - Поллер MeshCoreTel (`--api`) работает в отдельном потоке, независимо от USB
-    - При потере USB скрипт ждёт переподключения порта, но продолжает обновлять исходящих соседей через API
+  v3.2 — Версия 3.2, опция -u для USB
+    - Нумерация и описание: API по умолчанию, USB только с -u/--usb
+    - Сравнение USB vs API выполняется только при -u (внутри _connect_and_run)
+  v3.1 — API по умолчанию, USB по опции -u
+    - По умолчанию опрос API meshcoretel.ru (без серийного порта)
+    - Опция -u/--usb: дополнительно прослушивать Observer по USB
   v3.0 — Поддержка маршрутов 2 байта на хоп (Meshcore 1.14+)
     - Константа PATH_BYTES_PER_HOP (1 или 2): режим парсинга path и TRACE
     - Парсинг path/trace_route при 2 байтах на хоп; число хопов = len(path)
@@ -51,7 +54,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '3.1'
+__version__ = '3.2'
 
 import serial
 import time
@@ -96,6 +99,29 @@ def is_repeater_token(token: str) -> bool:
     # Повторяющиеся "33" (любая длина, кратная 2)
     return len(t) >= 2 and len(t) % 2 == 0 and all(t[i:i+2] == '33' for i in range(0, len(t), 2))
 
+
+# Наборы hash-пакетов для сравнения USB vs API.
+# _usb_hashes_curr  — USB-пакеты текущего цикла;
+# _usb_hashes_prev  — USB-пакеты предыдущего цикла;
+# _api_hashes_curr  — API-пакеты текущего интервала;
+# _api_hashes_prev  — API-пакеты предыдущего интервала.
+_usb_hashes_curr = set()
+_usb_hashes_prev = set()
+_api_hashes_curr = set()
+_api_hashes_prev = set()
+
+# Для USB-пакетов дополнительно запоминаем пример строки RX по hash,
+# чтобы в отладочном выводе можно было увидеть конкретные пакеты,
+# которых нет в API.
+_usb_hash_to_line_curr = {}
+_usb_hash_to_line_prev = {}
+
+# Накопительный счётчик пакетов, которые увидели по USB, но не увидели в API.
+_usb_only_total = 0
+
+# При --debug: множество origin, увиденных в API за цикл (для диагностики фильтра).
+_api_origins_seen = set()
+
 # ========== КОНФИГУРАЦИЯ ==========
 # Серийный порт, к которому подключена нода Meshcore.
 # macOS: обычно /dev/cu.usbmodemXXXX или /dev/cu.usbserial-XXXX
@@ -115,6 +141,11 @@ REPEATER_PREFIX = '33'
 # вида 33 33 33 ... (любая длина). В анализаторе хопы остаются побайтно, но
 # репитер определяется по префиксу REPEATER_PREFIX ИЛИ по маске (33)+.
 PATH_BYTES_PER_HOP = 1
+
+# Префиксы origin-нод в API MeshCoreTel, соответствующие вашему Observer/репитеру.
+# Сравнение идёт по startswith; если список пустой — для сравнения USB/API
+# учитываются все origin.
+OBSERVER_ORIGINS = ['MO Zvenigorod Room']
 
 # Виртуальный адрес для пакетов без конкретного источника (широковещательные).
 BROADCAST_NODE = 'BCAST'
@@ -512,6 +543,17 @@ def parse_line(line, stats, debug):
         if debug['rx_lines'] <= 3:
             debug.setdefault('rx_samples', []).append(line)
         try:
+            global _usb_hashes_curr, _usb_hash_to_line_curr
+            if 'hash=' in line:
+                try:
+                    pkt_hash = line.split('hash=')[1].split()[0]
+                    if pkt_hash:
+                        _usb_hashes_curr.add(pkt_hash)
+                        # Запоминаем пример строки для этого hash (только первый раз)
+                        _usb_hash_to_line_curr.setdefault(pkt_hash, line)
+                except IndexError:
+                    pass
+
             # Извлекаем SNR и RSSI из строки
             if 'SNR=' in line and 'RSSI=' in line:
                 snr_part = line.split('SNR=')[1].split()[0]
@@ -1027,7 +1069,7 @@ def print_outgoing_neighbors(cycle_info):
     print("=" * 70)
 
     if not outgoing_stats:
-        print("  Нет данных (включите --api или ждите расшифрованных сообщений с path)")
+        print("  Нет данных (ждём пакеты из API или расшифрованных сообщений с path)")
         print("=" * 70)
         return
 
@@ -1098,6 +1140,9 @@ def fetch_outgoing_from_api(repeater_prefix):
             if not pkt_hash or pkt_hash in _api_seen_hashes:
                 continue
             _api_seen_hashes.add(pkt_hash)
+            if DEBUG_MODE:
+                global _api_origins_seen
+                _api_origins_seen.add(pkt.get('origin', '?'))
 
             if pkt.get('payload_type') == 0x09:
                 continue
@@ -1105,6 +1150,20 @@ def fetch_outgoing_from_api(repeater_prefix):
             hops = pkt.get('path_hops')
             if not hops:
                 continue
+
+            origin = pkt.get('origin', '?')
+            # Сравнение USB vs API — по всем пакетам из API (MeshCoreTel отдаёт того, кто первым сообщил)
+            if pkt_hash:
+                _api_hashes_curr.add(pkt_hash)
+
+            is_my_observer = (OBSERVER_ORIGINS and
+                              any(origin.startswith(pref) for pref in OBSERVER_ORIGINS))
+            path_str = ' → '.join(hops)
+            if DEBUG_MODE:
+                my_tag = " [мой observer]" if is_my_observer else ""
+                ptype = PAYLOAD_TYPES.get(pkt.get('payload_type', -1), '?')
+                with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+                    f.write(f"[API] {origin}{my_tag}: {ptype} [{path_str}]\n")
 
             for i, hop in enumerate(hops):
                 if hop.upper() != prefix_upper:
@@ -1114,15 +1173,15 @@ def fetch_outgoing_from_api(repeater_prefix):
                 neighbor = hops[i + 1].upper()
                 outgoing_stats[neighbor]['total'] += 1
                 found += 1
-                origin = pkt.get('origin', '?')
                 path_str = ' → '.join(hops)
                 ptype = PAYLOAD_TYPES.get(pkt.get('payload_type', -1), '?')
+                my_tag = " [мой observer]" if is_my_observer else ""
                 if VERBOSE:
-                    print(f"  {CYAN}[API] {origin}: {ptype} "
+                    print(f"  {CYAN}[API] {origin}{my_tag}: {ptype} "
                           f"[{path_str}] → сосед {BOLD}{neighbor}{RESET}", flush=True)
                 if DEBUG_MODE:
-                    with open(DEBUG_LOG, 'a') as f:
-                        f.write(f"[API] {origin}: {ptype} [{path_str}] → сосед {neighbor}\n")
+                    with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+                        f.write(f"[API] {origin}{my_tag}: {ptype} [{path_str}] → сосед {neighbor}\n")
                 break
 
         if len(packets) < page_limit:
@@ -1198,8 +1257,7 @@ def _connect_and_run(args, port, cycle_counter):
             print(f"Дешифрование каналов: {', '.join(KNOWN_CHANNEL_NAMES)}")
         else:
             print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
-        if args.api:
-            print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+        print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
         if DEBUG_MODE:
             print(f"Отладка ->OBS: пакеты пишутся в {DEBUG_LOG}")
         print(flush=True)
@@ -1266,6 +1324,57 @@ def _connect_and_run(args, port, cycle_counter):
             if args.hops:
                 print_max_hops(cycle_info)
 
+            # В отладочном режиме сравниваем USB и API (только при -u; без USB этот блок не выполняется).
+            # Считаем так:
+            #   - USB: пакеты предыдущего цикла (_usb_hashes_prev)
+            #   - API: пакеты из предыдущего и текущего интервалов
+            # Ищем только те hash, которые были в USB, но так и не появились в API.
+            if DEBUG_MODE:
+                global _usb_hashes_curr, _usb_hashes_prev, _api_hashes_curr, _api_hashes_prev
+                global _usb_hash_to_line_curr, _usb_hash_to_line_prev, _usb_only_total
+                global _api_origins_seen
+                usb_prev = _usb_hashes_prev
+                api_union = _api_hashes_prev | _api_hashes_curr
+                if usb_prev:
+                    both = usb_prev & api_union
+                    usb_only_hashes = sorted(usb_prev - api_union)
+                    print("\nСРАВНЕНИЕ USB vs API (по hash):")
+                    print(f"  USB пакетов (предыдущий цикл): {len(usb_prev)}")
+                    print(f"  API пакетов (предыдущий+текущий, все origin): {len(api_union)}")
+                    print(f"  Совпали по hash: {len(both)}")
+                    _usb_only_total += len(usb_only_hashes)
+                    print(f"  Только USB: {len(usb_only_hashes)} (накопительно: {_usb_only_total})")
+                    if usb_only_hashes:
+                        print("  Пакеты только USB (hash и RX-строка):")
+                        for h in usb_only_hashes:
+                            line = _usb_hash_to_line_prev.get(h, '(строка RX недоступна)')
+                            print(f"    {h}: {line}")
+                    # Пишем тот же блок в отладочный лог
+                    try:
+                        with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+                            f.write("\nСРАВНЕНИЕ USB vs API (по hash):\n")
+                            f.write(f"  USB пакетов (предыдущий цикл): {len(usb_prev)}\n")
+                            f.write(f"  API пакетов (предыдущий+текущий, все origin): {len(api_union)}\n")
+                            f.write(f"  Совпали по hash: {len(both)}\n")
+                            f.write(f"  Только USB: {len(usb_only_hashes)} (накопительно: {_usb_only_total})\n")
+                            if usb_only_hashes:
+                                f.write("  Пакеты только USB (hash и RX-строка):\n")
+                                for h in usb_only_hashes:
+                                    line = _usb_hash_to_line_prev.get(h, '(строка RX недоступна)')
+                                    f.write(f"    {h}: {line}\n")
+                            f.write("-" * 70 + "\n")
+                    except Exception:
+                        pass
+                    print("-" * 70)
+                # переносим текущие наборы в "предыдущие" для следующего цикла
+                _usb_hashes_prev = _usb_hashes_curr.copy()
+                _usb_hashes_curr.clear()
+                _api_hashes_prev = _api_hashes_curr.copy()
+                _api_hashes_curr.clear()
+                _usb_hash_to_line_prev = _usb_hash_to_line_curr.copy()
+                _usb_hash_to_line_curr.clear()
+                _api_origins_seen.clear()
+
             save_stats()
 
     except (serial.SerialException, OSError) as e:
@@ -1284,43 +1393,60 @@ def _connect_and_run(args, port, cycle_counter):
 
 
 def main(args):
-    """Главный цикл работы анализатора с автоматическим переподключением.
+    """Главный цикл работы анализатора.
 
-    USB-часть (Observer по серийному порту) и API MeshCoreTel работают независимо:
-    при потере USB API-прослушка продолжает обновлять исходящих соседей.
+    API MeshCoreTel опрашивается по умолчанию. С опцией -u/--usb дополнительно
+    подключается к Observer по серийному порту (USB).
     """
     port = args.port
     cycle_counter = [0]
 
-    api_stop_event = threading.Event() if args.api else None
-    api_thread = None
+    api_stop_event = threading.Event()
+    api_thread = threading.Thread(
+        target=_api_poller,
+        args=(args.repeater, api_stop_event),
+        daemon=True,
+    )
+    api_thread.start()
 
     try:
-        # Глобальный API-поллер, не зависящий от состояния USB-порта
-        if args.api:
-            api_thread = threading.Thread(
-                target=_api_poller,
-                args=(args.repeater, api_stop_event),
-                daemon=True,
-            )
-            api_thread.start()
+        if args.usb:
+            # Режим с USB: подключаемся к порту, читаем лог, циклы и сравнение USB/API
+            while True:
+                if not os.path.exists(port):
+                    print(f"Порт {port} не найден. Ожидание подключения...", flush=True)
+                    _wait_for_port(port)
+                    time.sleep(2)
 
-        while True:
-            if not os.path.exists(port):
-                print(f"Порт {port} не найден. Ожидание подключения...", flush=True)
+                need_reconnect = _connect_and_run(args, port, cycle_counter)
+                if not need_reconnect:
+                    break
+
+                print(f"Ожидание переподключения к {port}... (API продолжает работать)", flush=True)
                 _wait_for_port(port)
                 time.sleep(2)
-
-            need_reconnect = _connect_and_run(args, port, cycle_counter)
-            if not need_reconnect:
-                break
-
-            if args.api:
-                print(f"Ожидание переподключения к {port}... (API продолжает работать)", flush=True)
-            else:
-                print(f"Ожидание переподключения к {port}...", flush=True)
-            _wait_for_port(port)
-            time.sleep(2)
+        else:
+            # Только API: циклы по таймеру, без серийного порта
+            print("Режим только API (без USB). Цикл статистики: каждые", CYCLE_TIME, "сек")
+            print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+            print(flush=True)
+            while True:
+                cycle_counter[0] += 1
+                time.sleep(CYCLE_TIME)
+                cycle_info = {
+                    'num': cycle_counter[0],
+                    'lines_read': 0,
+                    'rx_this': 0,
+                    'tx_this': 0,
+                }
+                if args.original:
+                    print_stats(stats, cycle_info, {})
+                if args.neighbors:
+                    print_neighbors(cycle_info)
+                    print_outgoing_neighbors(cycle_info)
+                if args.hops:
+                    print_max_hops(cycle_info)
+                save_stats()
 
     except KeyboardInterrupt:
         print("\n\nОстановлено пользователем")
@@ -1371,11 +1497,11 @@ if __name__ == "__main__":
     parser.add_argument('--hops', action='store_true',
                         help='Показывать пакет-рекордсмен по числу хопов '
                              '(тип, путь, канал для групповых сообщений)')
+    parser.add_argument('-u', '--usb', action='store_true',
+                        help='Прослушивать Observer по серийному порту (USB). '
+                             'Без этой опции работа только по API.')
     parser.add_argument('-p', '--port', default=PORT,
                         help=f'Серийный порт Observer-ноды (по умолчанию {PORT})')
-    parser.add_argument('--api', action='store_true',
-                        help='Получать исходящих соседей из API meshcoretel.ru '
-                             '(не требует отправки p/mt в канал)')
     parser.add_argument('--repeater', default=REPEATER_PREFIX,
                         help=f'Префикс ретранслятора для поиска через API '
                              f'(по умолчанию {REPEATER_PREFIX})')
@@ -1391,8 +1517,6 @@ if __name__ == "__main__":
     VERBOSE = args.verbose
     BOTS_MODE = args.bots
     DEBUG_MODE = args.debug
-    if args.api and not args.neighbors:
-        args.neighbors = True
     # Если ни один режим вывода не указан, показываем оригинальную статистику
     if not args.original and not args.neighbors and not args.hops:
         args.original = True
