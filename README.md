@@ -2,7 +2,7 @@
 
 Анализатор пакетов для [MeshCore](https://github.com/meshcore-dev/MeshCore) Observer. Подключается к ноде Room Server по серийному порту, в реальном времени читает радиопакеты и выводит статистику по узлам mesh-сети.
 
-**Версия 3.2** — API по умолчанию, USB только с опцией `-u`. Сравнение USB vs API (при `-d`) выполняется лишь при `-u`.
+**Версия 3.3** — API по умолчанию, USB только с опцией `-u`. Поддержка маршрутов 1/2/3 байта на хоп (1.14+) и noise_floor-статистики.
 
 ## Возможности
 
@@ -16,7 +16,7 @@
 - **Дешифрование каналов** — расшифровка групповых сообщений (GRP_TXT/GRP_DATA) публичных каналов (AES-128-ECB)
 - **Автоматическое переподключение** — при потере USB-соединения ждёт возвращения порта и продолжает работу
 - **Сохранение статистики** — накопленные данные сохраняются в `meshcore-stats.json` между запусками
-- **Декодирование RAW-пакетов** — парсинг заголовка MeshCore v1: route type, payload type, path (1 или 2 байта на хоп для 1.14+)
+- **Декодирование RAW-пакетов** — парсинг заголовка MeshCore v1: route type, payload type, path (1/2/3 байта на хоп для 1.14+)
 - **Цветовая раскраска** — свои ноды, ретрансляторы, broadcast, ->OBS и исходящие соседи визуально различаются
 
 ## Требования
@@ -25,13 +25,14 @@
 - [uv](https://docs.astral.sh/uv/)
 - [pyserial](https://pypi.org/project/pyserial/)
 - [pycryptodome](https://pypi.org/project/pycryptodome/) — для расшифровки групповых сообщений (опционально)
+- [paho-mqtt](https://pypi.org/project/paho-mqtt/) — для подписки на MQTT MeshCoreTel (опция `--mqtt`)
 - Нода MeshCore Room Server с функцией Observer, подключённая по USB
 
 ## Установка
 
 ```bash
 uv venv
-uv pip install pyserial pycryptodome
+uv pip install pyserial pycryptodome paho-mqtt
 ```
 
 ## Настройка
@@ -45,6 +46,16 @@ REPEATER_PREFIX = '33'           # префикс hex-адресов ваших 
 PATH_BYTES_PER_HOP = 1          # 1 — до 1.14, 2 — режим маршрутов 1.14+ (2 байта на хоп)
 MY_COMPANIONS = ['Kopcap V4️⃣', 'Kopcap 1️⃣1️⃣4️⃣']  # имена компаньонов для ack@/@ маршрутов
 CYCLE_TIME = 60                  # интервал вывода статистики (секунды)
+
+# MQTT MeshCoreTel (прошивка с analyzer.letsme.sh/observer: WebSockets, порт 9001)
+MQTT_SERVER = 'meshcoretel.ru'
+MQTT_PORT = 1883
+MQTT_PORT_WS = 9001
+MQTT_USE_WEBSOCKETS = True   # наблюдатель шлёт по WS:9001
+MQTT_USERNAME = 'meshcore'
+MQTT_PASSWORD = 'meshcore'
+MQTT_TOPICS = ['meshcore/+/+/packets', 'meshcore/+/+/status']
+MQTT_TOPICS_IATA = ['meshcore/MOW/+/packets', 'meshcore/MOW/+/status']  # ваш IATA
 
 # Известные публичные каналы для расшифровки
 KNOWN_CHANNEL_NAMES = [
@@ -79,6 +90,9 @@ uv run meshcore-analyzer.py
 # Указать порт (только при -u)
 uv run meshcore-analyzer.py -u -p /dev/cu.usbmodem1234
 
+# Подписка на MQTT MeshCoreTel (первые N сообщений — образец формата)
+uv run meshcore-analyzer.py -n --mqtt
+
 # Сбросить накопленную статистику и отладочный лог
 uv run meshcore-analyzer.py --reset
 ```
@@ -92,6 +106,7 @@ uv run meshcore-analyzer.py --reset
 | `-n`, `--neighbors` | Таблицы входящих и исходящих соседей |
 | `--hops` | Пакет-рекордсмен по числу хопов |
 | `-u`, `--usb` | Прослушивать Observer по серийному порту (USB) |
+| `--mqtt` | Подписка на MQTT meshcoretel.ru; первые N сообщений — образец формата |
 | `--repeater XX` | Префикс ретранслятора для поиска через API (по умолчанию `33`) |
 | `--bots` | Искать исходящих соседей через ответы ботов в каналах (при `-u`) |
 | `-d`, `--debug` | Логировать пакеты в файл `meshcore-debug.log` |

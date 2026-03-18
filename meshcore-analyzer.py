@@ -1,8 +1,14 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.2
+Version: 3.3
 
 Changelog:
+  v3.3 — Маршруты 1/2/3 байта на хоп (1.14+), шум эфира, подсветка режимов
+    - Парсинг packed path_len: mode+hops в одном байте (1/2/3 байта на хоп)
+    - Корректная расшифровка GRP_TXT/GRP_DATA при 2B/3B маршрутах (выбор валидной раскладки)
+    - Подсветка [2B]/[3B] в verbose и в «Рекорд хопов»
+    - Подавление спама DEBUG noise_floor в выводе; среднее noise_floor за цикл в таблице «СОСЕДИ»
+    - Debug: связывание hash из RX со строкой U RAW и вывод RAW для «Пакеты только USB»
   v3.2 — Версия 3.2, опция -u для USB
     - Нумерация и описание: API по умолчанию, USB только с -u/--usb
     - Сравнение USB vs API выполняется только при -u (внутри _connect_and_run)
@@ -54,7 +60,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '3.2'
+__version__ = '3.3'
 
 import serial
 import time
@@ -68,6 +74,7 @@ import threading
 import queue
 import urllib.request
 from collections import defaultdict
+from collections import deque
 
 try:
     from Crypto.Cipher import AES
@@ -75,12 +82,19 @@ try:
 except ImportError:
     HAS_CRYPTO = False
 
+try:
+    import paho.mqtt.client as mqtt
+    HAS_MQTT = True
+except ImportError:
+    HAS_MQTT = False
+
 # ========== ANSI-коды цветов для терминального вывода ==========
 GREEN = '\033[92m'
 CYAN = '\033[96m'
 YELLOW = '\033[93m'
 RED = '\033[91m'
 MAGENTA = '\033[95m'
+BLUE = '\033[94m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 # ===============================================================
@@ -116,6 +130,12 @@ _api_hashes_prev = set()
 _usb_hash_to_line_curr = {}
 _usb_hash_to_line_prev = {}
 
+# При --debug: пытаемся связать U RAW (без hash) с U: RX (с hash),
+# чтобы для "только USB" можно было увидеть сырой hex и path конкретного hash.
+_usb_hash_to_raw_curr = {}
+_usb_hash_to_raw_prev = {}
+_recent_raw_usb = deque(maxlen=50)  # элементы: {'payload_type','route_char','payload_len','hex','path'}
+
 # Накопительный счётчик пакетов, которые увидели по USB, но не увидели в API.
 _usb_only_total = 0
 
@@ -126,8 +146,8 @@ _api_origins_seen = set()
 # Серийный порт, к которому подключена нода Meshcore.
 # macOS: обычно /dev/cu.usbmodemXXXX или /dev/cu.usbserial-XXXX
 # Windows: COM24, COM3 и т.д.
-# PORT = '/dev/cu.usbmodemE8F60ACB1A401'    # коричневый корпус
-PORT = '/dev/cu.usbmodemE8F60ACB19781'      # черный корпус
+PORT = '/dev/cu.usbmodemE8F60ACB1A401'    # коричневый корпус
+# PORT = '/dev/cu.usbmodemE8F60ACB19781'      # черный корпус
 BAUDRATE = 115200
 
 # Префикс hex-адресов ваших нод-компаньонов. Подсвечиваются зелёным в таблице.
@@ -155,6 +175,26 @@ PATHBOT_SENDER = 'AetherByte\U0001f916'  # AetherByte🤖
 
 # Имена ваших компаньонов для обработки ack@[...] без префикса репитера.
 MY_COMPANIONS = ['Kopcap V4️⃣', 'Kopcap 1️⃣1️⃣4️⃣']
+
+# MQTT MeshCoreTel — настройки для подписки на поток пакетов (как при set mqtt.* на наблюдателе).
+# Подключение к тому же брокеру, куда наблюдатель отправляет пакеты.
+MQTT_SERVER = 'meshcoretel.ru'
+MQTT_PORT = 1883          # TCP (если MQTT_USE_WEBSOCKETS = False)
+MQTT_PORT_WS = 9001       # WebSockets (analyzer.letsme.sh/observer: порт 9001, WebSockets)
+MQTT_USE_WEBSOCKETS = True   # наблюдатель подключается по WS:9001, не TCP:1883
+MQTT_USERNAME = 'meshcore'
+MQTT_PASSWORD = 'meshcore'
+# Топики подписки (формат meshcoretomqtt: meshcore/{IATA}/{PUBLIC_KEY}/packets).
+# Подписка на # брокер может запрещать; используем явные шаблоны с +.
+MQTT_TOPICS = [
+    'meshcore/+/+/packets',   # пакеты от любых репитеров/наблюдателей
+    'meshcore/+/+/status',    # статус онлайн/офлайн
+]
+# Дополнительно топики для вашего IATA (mqtt.iata MOW), если брокер различает по региону:
+MQTT_TOPICS_IATA = ['meshcore/MOW/+/packets', 'meshcore/MOW/+/status']
+
+# Сколько первых MQTT-сообщений вывести в лог как образец формата (0 = не выводить).
+MQTT_LOG_FIRST_N_RAW = 10
 
 # Интервал между циклами сбора статистики (секунды).
 CYCLE_TIME = 60
@@ -252,8 +292,8 @@ outgoing_stats = defaultdict(lambda: {'total': 0})
 # Последний определённый сосед из RAW-пакета (для корреляции с SNR из RX-строки)
 _last_raw_neighbor = None
 
-# Рекорд максимального числа хопов (dict с данными пакета или None)
-max_hops_record = None
+# Рекорды максимального числа хопов отдельно по 1B/2B/3B.
+max_hops_by_bph = {1: None, 2: None, 3: None}
 
 # Путь к файлу сохранения статистики (рядом со скриптом)
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'meshcore-stats.json')
@@ -266,6 +306,11 @@ _api_last_id = None
 # Множество обработанных хешей пакетов (дедупликация: один пакет виден многим наблюдателям)
 _api_seen_hashes = set()
 
+# Счётчик залогированных сырых MQTT-сообщений (для вывода образцов формата).
+_mqtt_samples_logged = 0
+# Счётчик всех пришедших MQTT-сообщений (для диагностики «ничего не приходит»).
+_mqtt_messages_received = 0
+
 
 def save_stats():
     """Сохраняет накопленную статистику в JSON-файл."""
@@ -273,14 +318,19 @@ def save_stats():
         'stats': dict(stats),
         'neighbor_stats': dict(neighbor_stats),
         'outgoing_stats': dict(outgoing_stats),
-        'max_hops_record': None,
+        'max_hops_by_bph': {},
     }
-    if max_hops_record:
-        # payload — bytes, конвертируем в hex для JSON
-        r = dict(max_hops_record)
-        if isinstance(r.get('payload'), (bytes, bytearray)):
-            r['payload'] = r['payload'].hex()
-        data['max_hops_record'] = r
+    # Отдельные рекорды по 1B/2B/3B
+    try:
+        for bph, rec in max_hops_by_bph.items():
+            if not rec:
+                continue
+            r = dict(rec)
+            if isinstance(r.get('payload'), (bytes, bytearray)):
+                r['payload'] = r['payload'].hex()
+            data['max_hops_by_bph'][str(bph)] = r
+    except Exception:
+        pass
     try:
         with open(STATS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -290,7 +340,7 @@ def save_stats():
 
 def load_stats():
     """Загружает статистику из JSON-файла, если он существует."""
-    global max_hops_record
+    global max_hops_by_bph
     if not os.path.exists(STATS_FILE):
         return
     try:
@@ -305,12 +355,18 @@ def load_stats():
         for node, vals in data.get('outgoing_stats', {}).items():
             for k, v in vals.items():
                 outgoing_stats[node][k] = v
-        r = data.get('max_hops_record')
-        if r:
-            # Восстанавливаем payload из hex в bytes
-            if isinstance(r.get('payload'), str):
-                r['payload'] = bytes.fromhex(r['payload'])
-            max_hops_record = r
+        max_hops_by_bph = {1: None, 2: None, 3: None}
+        for k, rec in (data.get('max_hops_by_bph') or {}).items():
+            try:
+                bph = int(k)
+            except Exception:
+                continue
+            if bph not in (1, 2, 3) or not isinstance(rec, dict):
+                continue
+            if isinstance(rec.get('payload'), str):
+                rec = dict(rec)
+                rec['payload'] = bytes.fromhex(rec['payload'])
+            max_hops_by_bph[bph] = rec
         total_rx = sum(d['rx'] for d in stats.values())
         print(f"Загружена статистика: {len(stats)} узлов, {total_rx} RX, "
               f"{len(neighbor_stats)} соседей, {len(outgoing_stats)} исх. соседей")
@@ -318,11 +374,130 @@ def load_stats():
         print(f"{YELLOW}Ошибка загрузки статистики: {e}{RESET}")
 
 
+def _process_mqtt_payload(topic, payload_bytes):
+    """Обрабатывает одно MQTT-сообщение: логирует сырой формат и обновляет статистику.
+
+    Сначала выводит несколько образцов (MQTT_LOG_FIRST_N_RAW), чтобы увидеть формат.
+    Пытается распарсить JSON (path/path_hops, hash, snr, rssi) или сырую hex-строку.
+    """
+    global _mqtt_samples_logged, _mqtt_messages_received, max_hops_by_bph
+    _mqtt_messages_received += 1
+    try:
+        payload = payload_bytes.decode('utf-8', errors='replace') if isinstance(payload_bytes, bytes) else str(payload_bytes)
+    except Exception:
+        payload = str(payload_bytes)
+
+    # Логируем первые N сообщений как образец формата
+    if MQTT_LOG_FIRST_N_RAW > 0 and _mqtt_samples_logged < MQTT_LOG_FIRST_N_RAW:
+        _mqtt_samples_logged += 1
+        sample = payload[:500] + ('...' if len(payload) > 500 else '')
+        print(f"{CYAN}[MQTT] образец #{_mqtt_samples_logged} topic={topic} payload={sample}{RESET}", flush=True)
+        if DEBUG_MODE and DEBUG_LOG:
+            try:
+                with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+                    f.write(f"[MQTT] topic={topic} payload={payload[:2000]}\n")
+            except Exception:
+                pass
+
+    # Пробуем JSON
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if isinstance(data, dict):
+        # Формат meshcoretomqtt: path может быть строка "C2 -> E2" или массив; также есть "raw" (hex).
+        path = data.get('path') or data.get('path_hops')
+        if isinstance(path, str):
+            # "C2 -> E2" или "C2, E2" -> список хопов
+            path = [x.strip().upper() for x in re.split(r'\s*->\s*|\s*,\s*', path) if x.strip()]
+        if not path and isinstance(data.get('raw'), str):
+            parsed = parse_raw(re.sub(r'\s+', '', data['raw']))
+            if parsed and parsed.get('path'):
+                path = parsed['path']
+        if path and isinstance(path, (list, tuple)):
+            hops = [str(h).strip().upper() for h in path]
+            # Нормализуем до 2 hex-символов на хоп (берём последние 2 если длиннее)
+            path_norm = []
+            for h in hops:
+                h = re.sub(r'[^0-9A-Fa-f]', '', h)
+                if len(h) >= 2:
+                    path_norm.append(h[-2:].upper())
+                elif len(h) == 1:
+                    path_norm.append(('0' + h).upper())
+            if path_norm:
+                nb = None
+                if len(path_norm) >= 2 and is_repeater_token(path_norm[-1]):
+                    nb = path_norm[-2]
+                elif path_norm:
+                    nb = path_norm[-1]
+                if nb:
+                    neighbor_stats[nb]['total'] += 1
+                    # meshcoretomqtt шлёт "SNR"/"RSSI" с большой буквы
+                    snr = data.get('snr') or data.get('SNR')
+                    if snr is not None:
+                        try:
+                            s = float(snr)
+                            neighbor_stats[nb]['snr_sum'] += s
+                            neighbor_stats[nb]['snr_count'] += 1
+                        except (TypeError, ValueError):
+                            pass
+                rec = max_hops_by_bph.get(1)
+                if rec is None or len(path_norm) > rec.get('hops', 0):
+                    max_hops_by_bph[1] = {
+                        'time': time.strftime('%H:%M:%S - %d/%m/%Y'),
+                        'hops': len(path_norm),
+                        'path': path_norm,
+                        'path_bytes_per_hop': 1,
+                        'route_name': 'MQTT',
+                        'payload_name': data.get('type', ''),
+                        'payload_type': -1,
+                        'payload': b'',
+                    }
+        return
+
+    # Пробуем сырую hex-строку (как в U RAW)
+    raw_hex = re.sub(r'\s+', '', payload.strip())
+    if len(raw_hex) >= 10 and all(c in '0123456789abcdefABCDEF' for c in raw_hex):
+        parsed = parse_raw(raw_hex)
+        if parsed and parsed.get('path'):
+            path = parsed['path']
+            is_trace = parsed.get('trace_route') is not None
+            if not is_trace:
+                last = path[-1]
+                if is_repeater_token(last) and len(path) >= 2:
+                    nb = path[-2]
+                else:
+                    nb = last
+                if nb:
+                    neighbor_stats[nb]['total'] += 1
+                hops = len(path)
+                if bph in (1, 2, 3):
+                    rec = max_hops_by_bph.get(bph)
+                    if rec is None or hops > rec.get('hops', 0):
+                        max_hops_by_bph[bph] = {
+                            'time': time.strftime('%H:%M:%S - %d/%m/%Y'),
+                            'hops': hops,
+                            'path': path,
+                            'path_bytes_per_hop': bph,
+                            'route_name': parsed.get('route_name', 'MQTT'),
+                            'payload_name': parsed.get('payload_name', ''),
+                            'payload_type': parsed.get('payload_type', -1),
+                            'payload': parsed.get('payload', b''),
+                        }
+
+
 def parse_raw(hex_str):
     """Парсит сырые hex-данные пакета MeshCore и извлекает заголовок, path и метаданные.
 
     Формат пакета (v1):
-      [header 1B][transport_codes 4B (опц.)][path_length 1B][path NB][payload]
+      [header 1B][transport_codes 4B (опц.)][path_len 1B][path ...][payload]
+
+    Начиная с прошивок 1.14 возможен режим 1/2/3 байта на хоп.
+    В этом режиме один байт после header кодирует сразу и число хопов, и размер хопа:
+      - старшие 2 бита: mode (0/1/2 => 1/2/3 байта на хоп)
+      - младшие 6 бит: hops (0..63)
+    Пример: 0x41 = 0b01_000001 => mode=1 (2B), hops=1.
 
     Header (1 байт, 0bVVPPPPRR):
       - биты 0-1: route type (FLOOD, DIRECT, TRANSPORT_*)
@@ -334,8 +509,8 @@ def parse_raw(hex_str):
 
     Returns:
         dict с полями: route_type, payload_type, route_name, payload_name,
-                       path_length (байт в пути), path (список хопов;
-                       при PATH_BYTES_PER_HOP==2 элемент — 4 hex),
+                       path_length (как в пакете: bytes или hops, см. ниже),
+                       path_bytes_per_hop (1/2/3), path_hops, path (список хопов),
                        payload (bytes), или None при ошибке
     """
     try:
@@ -356,15 +531,91 @@ def parse_raw(hex_str):
 
         path_length = data[offset]
         offset += 1
-
-        if offset + path_length > len(data):
+        if offset >= len(data):
             return None
 
-        # Маршрут: пока парсим побайтно; прошивки могут использовать 1/2/3 байта
-        # на адрес, но в логе Observer path приходит как сырые байты. В дальнейшем
-        # можно группировать байты по PATH_BYTES_PER_HOP, сейчас оставляем по 1.
-        path = [f"{b:02X}" for b in data[offset:offset + path_length]]
-        payload = data[offset + path_length:]
+        # В старых прошивках path_length — это число БАЙТ маршрута.
+        # В 1.14+ path_length может быть упакованным (mode+hops). Авто-распознаём по эвристике.
+
+        def _looks_like_group_payload(p: bytes) -> bool:
+            if not p or len(p) < 4:
+                return False
+            # payload: [channel_hash:1][MAC:2][ciphertext]; ciphertext кратен 16
+            ct = p[3:]
+            if len(ct) == 0 or (len(ct) % 16) != 0:
+                return False
+            # Дополнительная эвристика: известный hash канала
+            return (p[0] in CHANNEL_KEYS) if CHANNEL_KEYS else True
+
+        def _decode_path(raw: bytes, bph: int) -> list[str]:
+            out = []
+            for i in range(0, len(raw), bph):
+                chunk = raw[i:i + bph]
+                if len(chunk) != bph:
+                    break
+                out.append(chunk.hex().upper())
+            return out
+
+        offset_after_len = offset
+
+        # Вариант A (старый): path_length = bytes
+        old_path_bytes_len = int(path_length)
+        old_valid = (offset_after_len + old_path_bytes_len) <= len(data)
+        if old_valid:
+            old_raw_path = data[offset_after_len:offset_after_len + old_path_bytes_len]
+            old_payload = data[offset_after_len + old_path_bytes_len:]
+        else:
+            old_raw_path = b''
+            old_payload = b''
+
+        # Вариант B (1.14+): path_length упакован как mode+hops
+        packed = int(path_length)
+        packed_mode = (packed >> 6) & 0x03
+        packed_hops = packed & 0x3F
+        new_ok = packed_mode in (0, 1, 2)
+        new_bph = packed_mode + 1
+        new_hops = packed_hops
+        new_path_bytes_len = new_hops * new_bph
+        if new_ok and (offset_after_len + new_path_bytes_len) <= len(data):
+            new_raw_path = data[offset_after_len:offset_after_len + new_path_bytes_len]
+            new_payload = data[offset_after_len + new_path_bytes_len:]
+        else:
+            new_ok = False
+            new_raw_path = b''
+            new_payload = b''
+
+        # Выбор интерпретации
+        # Если один из вариантов вообще невалиден — берём другой.
+        if new_ok and not old_valid:
+            use_new = True
+        elif old_valid and not new_ok:
+            use_new = False
+        else:
+            use_new = False
+            if new_ok and payload_type in (0x05, 0x06):
+            # Для GRP_* выбираем вариант, который даёт валидный формат ciphertext
+                if _looks_like_group_payload(new_payload) and not _looks_like_group_payload(old_payload):
+                    use_new = True
+            elif new_ok and new_bph in (2, 3):
+                # Для остальных: если явно 2B/3B и всё укладывается — используем новый
+                use_new = True
+
+        if not old_valid and not new_ok:
+            return None
+
+        if use_new:
+            path_bytes_per_hop = new_bph
+            path_hops = new_hops
+            raw_path = new_raw_path
+            payload = new_payload
+        else:
+            path_bytes_per_hop = 1
+            path_hops = old_path_bytes_len  # побайтно
+            raw_path = old_raw_path
+            payload = old_payload
+
+        # Группируем raw_path в хопы по path_bytes_per_hop (1/2/3)
+        path = _decode_path(raw_path, path_bytes_per_hop)
 
         # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix
         dest = None
@@ -372,17 +623,48 @@ def parse_raw(hex_str):
             dest = payload[:6].hex().upper()
 
         # TRACE-пакеты: path содержит SNR (×4) на каждом хопе, а не узлы;
-        # маршрут трассировки — в конце payload (после dest[6] + meta[3])
+        # маршрут трассировки — в конце payload.
+        # В 1.14+ размер адреса (1/2/3 байта) для TRACE задаётся отдельным байтом
+        # в payload сразу после dest[6] + meta[3].
         trace_route = None
         trace_snr = None
         if payload_type == 0x09 and route_type in (0x02, 0x03):
-            # SNR: по одному байту на хоп
-            trace_snr = [(b - 256 if b > 127 else b) / 4.0
-                         for b in data[offset:offset + path_length]]
+            # В TRACE поле path всегда содержит SNR (по 1 байту на хоп).
+            snr_count = int(path_length)  # это именно число SNR-байт
+            snr_bytes = raw_path[:snr_count] if raw_path else b''
+            trace_snr = [(b - 256 if b > 127 else b) / 4.0 for b in snr_bytes]
             if len(payload) > 9:
-                # Маршрут трассировки — тоже побайтно; адреса могут быть 1–3 байта.
-                raw_route = payload[9:]
-                trace_route = [f"{b:02X}" for b in raw_route]
+                # Встречаются два варианта TRACE-пэйлоада:
+                #  1) dest[6] + meta[3] (где meta[2] = mode 0/1/2) + route_bytes...
+                #  2) dest[6] + meta[3] + mode[1] + route_bytes...
+                mode = None
+                route_start = 9  # после dest[6]+meta[3]
+                if len(payload) > 10 and payload[9] in (0, 1, 2):
+                    # вариант 2: отдельный mode-байт
+                    mode = payload[9]
+                    route_start = 10
+                elif payload[8] in (0, 1, 2):
+                    # вариант 1: mode зашит в последнем байте meta
+                    mode = payload[8]
+                    route_start = 9
+                route_bph = (mode + 1) if mode in (0, 1, 2) else 1
+                raw_route = payload[route_start:]
+                # Если mode не определился, пробуем эвристику: у вашего репитера ключ (33)+,
+                # поэтому в 2B/3B режимах часто встречаются байты 33 33 (или 33 33 33).
+                if route_bph == 1 and raw_route:
+                    if len(raw_route) % 3 == 0 and b'\x33\x33\x33' in raw_route:
+                        route_bph = 3
+                    elif len(raw_route) % 2 == 0 and b'\x33\x33' in raw_route:
+                        route_bph = 2
+                if route_bph > 1 and len(raw_route) >= route_bph:
+                    trace_route = []
+                    for i in range(0, len(raw_route), route_bph):
+                        chunk = raw_route[i:i + route_bph]
+                        if len(chunk) != route_bph:
+                            break
+                        trace_route.append(chunk.hex().upper())
+                else:
+                    trace_route = [f"{b:02X}" for b in raw_route]
 
         return {
             'route_type': route_type,
@@ -390,6 +672,8 @@ def parse_raw(hex_str):
             'route_name': ROUTE_TYPES.get(route_type, f'?{route_type}'),
             'payload_name': PAYLOAD_TYPES.get(payload_type, f'?{payload_type}'),
             'path_length': path_length,
+            'path_bytes_per_hop': path_bytes_per_hop,
+            'path_hops': path_hops,
             'path': path,
             'payload': payload,
             'dest': dest,
@@ -526,11 +810,22 @@ def parse_line(line, stats, debug):
         stats: глобальный словарь статистики (defaultdict)
         debug: словарь отладочных счётчиков текущего цикла
     """
-    global _last_raw_neighbor, max_hops_record
+    global _last_raw_neighbor, max_hops_by_bph
     debug['total'] += 1
 
     # Пропускаем служебные строки (команда log, маркер EOF, пустые)
     if not line or line.startswith('log') or 'EOF' in line:
+        debug['ignored'] += 1
+        return
+
+    # Прошивка может писать служебный шум эфира (мешает живому выводу).
+    # Эти строки не показываем, но собираем среднее noise_floor за цикл.
+    if 'noise_floor' in line and 'RadioLibWrapper' in line:
+        m = re.search(r'noise_floor\s*=\s*(-?\d+)', line)
+        if m:
+            nf = int(m.group(1))
+            debug['noise_floor_sum'] = debug.get('noise_floor_sum', 0) + nf
+            debug['noise_floor_count'] = debug.get('noise_floor_count', 0) + 1
         debug['ignored'] += 1
         return
 
@@ -544,6 +839,7 @@ def parse_line(line, stats, debug):
             debug.setdefault('rx_samples', []).append(line)
         try:
             global _usb_hashes_curr, _usb_hash_to_line_curr
+            global _usb_hash_to_raw_curr
             if 'hash=' in line:
                 try:
                     pkt_hash = line.split('hash=')[1].split()[0]
@@ -551,6 +847,31 @@ def parse_line(line, stats, debug):
                         _usb_hashes_curr.add(pkt_hash)
                         # Запоминаем пример строки для этого hash (только первый раз)
                         _usb_hash_to_line_curr.setdefault(pkt_hash, line)
+
+                        # Если есть недавний U RAW, пытаемся сопоставить его с этой RX-строкой
+                        # по (type, route, payload_len). Это нужно только для отладки.
+                        if DEBUG_MODE and _recent_raw_usb:
+                            try:
+                                route_char = None
+                                if 'route=' in line:
+                                    route_char = line.split('route=')[1].split(',')[0].strip()
+                                payload_len = None
+                                if 'payload_len=' in line:
+                                    payload_len = int(line.split('payload_len=')[1].split(')')[0])
+                            except Exception:
+                                route_char = None
+                                payload_len = None
+
+                            if route_char and payload_len is not None:
+                                for entry in reversed(_recent_raw_usb):
+                                    if (entry.get('payload_type') == ptype and
+                                            entry.get('route_char') == route_char and
+                                            entry.get('payload_len') == payload_len):
+                                        _usb_hash_to_raw_curr.setdefault(pkt_hash, {
+                                            'hex': entry.get('hex'),
+                                            'path': entry.get('path'),
+                                        })
+                                        break
                 except IndexError:
                     pass
 
@@ -646,6 +967,18 @@ def parse_line(line, stats, debug):
             path_str = ','.join(parsed['path']) if parsed['path'] else '-'
             hops = len(parsed['path'])
 
+            # Для последующего связывания с hash из RX-строки сохраняем короткую сигнатуру RAW.
+            # route_char: RX использует 'route=F' для FLOOD и 'route=D' для DIRECT.
+            route_char = 'F' if parsed.get('route_type') in (0x00, 0x01) else ('D' if parsed.get('route_type') in (0x02, 0x03) else None)
+            payload_len = len(parsed.get('payload') or b'')
+            _recent_raw_usb.append({
+                'payload_type': parsed.get('payload_type'),
+                'route_char': route_char,
+                'payload_len': payload_len,
+                'hex': hex_str,
+                'path': parsed.get('path') or [],
+            })
+
             # Расшифровка групповых сообщений
             decrypted = None
             outgoing_nbs = []
@@ -703,10 +1036,25 @@ def parse_line(line, stats, debug):
                 if parsed.get('trace_route') is not None:
                     route_str = '→'.join(parsed['trace_route']) if parsed['trace_route'] else '?'
                     snr_str = ','.join(f"{s:.2f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
-                    print(f"{CYAN}    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]{RESET}", flush=True)
+                    # Для TRACE размер адреса может быть 1/2/3 байта; косвенно видно по длине токенов.
+                    mode_tag = ""
+                    if parsed['trace_route']:
+                        tok_len = len(parsed['trace_route'][0])
+                        if tok_len == 4:
+                            mode_tag = f" {BLUE}{BOLD}[2B]{RESET}"
+                        elif tok_len == 6:
+                            mode_tag = f" {MAGENTA}{BOLD}[3B]{RESET}"
+                    print(f"{CYAN}    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]{mode_tag}{RESET}", flush=True)
                 else:
+                    # Подсветка нестандартных маршрутов: 2B/3B на хоп (прошивки 1.14+)
+                    bph = parsed.get('path_bytes_per_hop', 1)
+                    mode_tag = ""
+                    if bph == 2:
+                        mode_tag = f" {BLUE}{BOLD}[2B]{RESET}{color}"
+                    elif bph == 3:
+                        mode_tag = f" {MAGENTA}{BOLD}[3B]{RESET}{color}"
                     dest_tag = f" -> {parsed['dest']}" if parsed.get('dest') else ""
-                    print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{dest_tag}{obs_tag}{end}", flush=True)
+                    print(f"{color}    -> {pkt_label} | hops={hops} path=[{path_str}]{mode_tag}{dest_tag}{obs_tag}{end}", flush=True)
                 if decrypted:
                     text = decrypted['text']
                     if ': ' in text:
@@ -743,16 +1091,20 @@ def parse_line(line, stats, debug):
                     stats[node_hash]['hops_seen'] += 1
 
                 pkt_time = line.split(' U RAW:')[0].strip() if ' U RAW:' in line else '?'
-                if max_hops_record is None or hops > max_hops_record['hops']:
-                    max_hops_record = {
-                        'time': pkt_time,
-                        'hops': hops,
-                        'path': parsed['path'],
-                        'route_name': parsed['route_name'],
-                        'payload_name': parsed['payload_name'],
-                        'payload_type': parsed['payload_type'],
-                        'payload': parsed['payload'],
-                    }
+                bph = parsed.get('path_bytes_per_hop', 1)
+                if bph in (1, 2, 3):
+                    rec = max_hops_by_bph.get(bph)
+                    if rec is None or hops > rec.get('hops', 0):
+                        max_hops_by_bph[bph] = {
+                            'time': pkt_time,
+                            'hops': hops,
+                            'path': parsed['path'],
+                            'path_bytes_per_hop': bph,
+                            'route_name': parsed['route_name'],
+                            'payload_name': parsed['payload_name'],
+                            'payload_type': parsed['payload_type'],
+                            'payload': parsed['payload'],
+                        }
 
             # Сохраняем примеры распарсенных RAW для диагностики
             if debug['raw_lines'] <= 3:
@@ -988,27 +1340,35 @@ def print_max_hops(cycle_info):
     print(f"РЕКОРД ХОПОВ (цикл {cycle_info['num']})")
     print("=" * 70)
 
-    if not max_hops_record:
-        print("  Нет данных")
-        print("=" * 70)
-        return
+    def _print_record(title, r):
+        if not r:
+            print(f"  {title}: нет данных")
+            return
+        path_str = ','.join(r['path']) if r.get('path') else '-'
+        pkt_label = f"{r.get('route_name', '?')} {r.get('payload_name', '?')}"
+        payload_info = decode_payload_info(r.get('payload_type', -1), r.get('payload', b''))
+        print(f"  {title}:")
+        print(f"    Время:  {r.get('time', '?')}")
+        print(f"    Тип:    {pkt_label}")
+        print(f"    Хопов:  {r.get('hops', 0)}")
+        bph = r.get('path_bytes_per_hop', 1)
+        if bph == 2:
+            print(f"    Path:   [{BLUE}{BOLD}{path_str}{RESET}] {BLUE}{BOLD}[2B]{RESET}")
+        elif bph == 3:
+            print(f"    Path:   [{MAGENTA}{BOLD}{path_str}{RESET}] {MAGENTA}{BOLD}[3B]{RESET}")
+        else:
+            print(f"    Path:   [{path_str}]")
+        if payload_info:
+            print(f"    Инфо:   {payload_info}")
 
-    r = max_hops_record
-    path_str = ','.join(r['path']) if r['path'] else '-'
-    pkt_label = f"{r['route_name']} {r['payload_name']}"
-    payload_info = decode_payload_info(r['payload_type'], r['payload'])
-
-    print(f"  Время:  {r['time']}")
-    print(f"  Тип:    {pkt_label}")
-    print(f"  Хопов:  {r['hops']}")
-    print(f"  Path:   [{path_str}]")
-    if payload_info:
-        print(f"  Инфо:   {payload_info}")
+    _print_record("Рекорд (1B)", max_hops_by_bph.get(1))
+    _print_record("Рекорд (2B)", max_hops_by_bph.get(2))
+    _print_record("Рекорд (3B)", max_hops_by_bph.get(3))
 
     print("=" * 70)
 
 
-def print_neighbors(cycle_info):
+def print_neighbors(cycle_info, debug=None):
     """Выводит таблицу соседей — узлов, доставляющих пакеты ретранслятору и наблюдателю.
 
     Сосед определяется из path FLOOD-пакетов.
@@ -1016,9 +1376,16 @@ def print_neighbors(cycle_info):
 
     Args:
         cycle_info: dict с данными цикла
+        debug: dict с отладочными счётчиками (опционально)
     """
     print("\n" + "=" * 70)
     print(f"СОСЕДИ (цикл {cycle_info['num']})")
+
+    if debug and debug.get('noise_floor_count'):
+        avg_nf = debug['noise_floor_sum'] / debug['noise_floor_count']
+        print(f"Noise floor (среднее за цикл): {avg_nf:.1f} dBm  "
+              f"(n={debug['noise_floor_count']})")
+
     print("=" * 70)
 
     if not neighbor_stats:
@@ -1209,6 +1576,75 @@ def _api_poller(repeater_prefix, stop_event):
             time.sleep(1)
 
 
+def _mqtt_thread(stop_event):
+    """Фоновый поток: подписка на MQTT MeshCoreTel, обработка входящих сообщений."""
+    if not HAS_MQTT:
+        return
+    transport = "websockets" if MQTT_USE_WEBSOCKETS else "tcp"
+    port = MQTT_PORT_WS if MQTT_USE_WEBSOCKETS else MQTT_PORT
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport=transport)
+    except (AttributeError, TypeError):
+        try:
+            client = mqtt.Client(transport=transport)
+        except TypeError:
+            client = mqtt.Client()
+            transport = "tcp"
+            port = MQTT_PORT
+    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+    def _rc_value(rc):
+        """Приводит reason_code к int (и для VERSION1, и для VERSION2)."""
+        return getattr(rc, 'value', rc) if rc is not None else 0
+
+    def on_connect(c, userdata, flags, reason_code, properties=None):
+        if _rc_value(reason_code) == 0:
+            for t in MQTT_TOPICS + MQTT_TOPICS_IATA:
+                c.subscribe(t)
+            try:
+                c.subscribe('#')  # если брокер разрешает — увидим любые топики
+            except Exception:
+                pass
+            print(f"{CYAN}[MQTT] подключено к {MQTT_SERVER}:{port} ({transport}){RESET}", flush=True)
+            print(f"  подписки: meshcore/+/+/packets|status, meshcore/MOW/+/packets|status, #", flush=True)
+        else:
+            print(f"{YELLOW}[MQTT] подключение отклонено, reason_code={_rc_value(reason_code)}{RESET}", flush=True)
+
+    def on_disconnect(c, userdata, *rest):
+        # VERSION1: (client, userdata, rc); VERSION2: (client, userdata, flags, reason_code, properties)
+        rc = rest[1] if len(rest) >= 2 else (rest[0] if rest else 0)
+        if _rc_value(rc) != 0:
+            print(f"{YELLOW}[MQTT] отключено, reason_code={_rc_value(rc)}{RESET}", flush=True)
+
+    def on_message(c, userdata, msg):
+        try:
+            _process_mqtt_payload(msg.topic, msg.payload)
+            # Первые 20 сообщений — краткий лог «получено», чтобы убедиться, что что-то приходит.
+            if _mqtt_messages_received <= 20:
+                print(f"{CYAN}[MQTT] получено сообщение #{_mqtt_messages_received} topic={msg.topic} len={len(msg.payload)}{RESET}", flush=True)
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"{YELLOW}[MQTT] ошибка обработки: {e}{RESET}", flush=True)
+
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    try:
+        print(f"{CYAN}[MQTT] подключение к {MQTT_SERVER}:{port} ({transport})...{RESET}", flush=True)
+        client.connect(MQTT_SERVER, port, 60)
+        client.loop_start()
+        while not stop_event.wait(timeout=1):
+            pass
+    except Exception as e:
+        print(f"{YELLOW}[MQTT] ошибка подключения: {e}{RESET}", flush=True)
+    finally:
+        client.loop_stop()
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+
 def _serial_reader(ser, line_queue, stop_event, error_event):
     """Фоновый поток: непрерывно читает серийный порт и кладёт строки в очередь.
 
@@ -1319,7 +1755,7 @@ def _connect_and_run(args, port, cycle_counter):
             if args.original:
                 print_stats(stats, cycle_info, debug)
             if args.neighbors:
-                print_neighbors(cycle_info)
+                print_neighbors(cycle_info, debug)
                 print_outgoing_neighbors(cycle_info)
             if args.hops:
                 print_max_hops(cycle_info)
@@ -1332,6 +1768,7 @@ def _connect_and_run(args, port, cycle_counter):
             if DEBUG_MODE:
                 global _usb_hashes_curr, _usb_hashes_prev, _api_hashes_curr, _api_hashes_prev
                 global _usb_hash_to_line_curr, _usb_hash_to_line_prev, _usb_only_total
+                global _usb_hash_to_raw_curr, _usb_hash_to_raw_prev
                 global _api_origins_seen
                 usb_prev = _usb_hashes_prev
                 api_union = _api_hashes_prev | _api_hashes_curr
@@ -1349,6 +1786,12 @@ def _connect_and_run(args, port, cycle_counter):
                         for h in usb_only_hashes:
                             line = _usb_hash_to_line_prev.get(h, '(строка RX недоступна)')
                             print(f"    {h}: {line}")
+                            raw = _usb_hash_to_raw_prev.get(h)
+                            if raw and raw.get('hex'):
+                                path = raw.get('path') or []
+                                print(f"      RAW: {raw['hex']}")
+                                if path:
+                                    print(f"      path(bytes)=[{','.join(path)}]")
                     # Пишем тот же блок в отладочный лог
                     try:
                         with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
@@ -1362,6 +1805,11 @@ def _connect_and_run(args, port, cycle_counter):
                                 for h in usb_only_hashes:
                                     line = _usb_hash_to_line_prev.get(h, '(строка RX недоступна)')
                                     f.write(f"    {h}: {line}\n")
+                                    raw = _usb_hash_to_raw_prev.get(h)
+                                    if raw and raw.get('hex'):
+                                        f.write(f"      RAW: {raw['hex']}\n")
+                                        if raw.get('path'):
+                                            f.write(f"      path(bytes)=[{','.join(raw['path'])}]\n")
                             f.write("-" * 70 + "\n")
                     except Exception:
                         pass
@@ -1373,6 +1821,8 @@ def _connect_and_run(args, port, cycle_counter):
                 _api_hashes_curr.clear()
                 _usb_hash_to_line_prev = _usb_hash_to_line_curr.copy()
                 _usb_hash_to_line_curr.clear()
+                _usb_hash_to_raw_prev = _usb_hash_to_raw_curr.copy()
+                _usb_hash_to_raw_curr.clear()
                 _api_origins_seen.clear()
 
             save_stats()
@@ -1409,6 +1859,16 @@ def main(args):
     )
     api_thread.start()
 
+    mqtt_thread = None
+    mqtt_stop_event = None
+    if getattr(args, 'mqtt', False):
+        if HAS_MQTT:
+            mqtt_stop_event = threading.Event()
+            mqtt_thread = threading.Thread(target=_mqtt_thread, args=(mqtt_stop_event,), daemon=True)
+            mqtt_thread.start()
+        else:
+            print(f"{YELLOW}Опция --mqtt требует paho-mqtt: uv pip install paho-mqtt{RESET}", flush=True)
+
     try:
         if args.usb:
             # Режим с USB: подключаемся к порту, читаем лог, циклы и сравнение USB/API
@@ -1442,7 +1902,7 @@ def main(args):
                 if args.original:
                     print_stats(stats, cycle_info, {})
                 if args.neighbors:
-                    print_neighbors(cycle_info)
+                    print_neighbors(cycle_info, {})
                     print_outgoing_neighbors(cycle_info)
                 if args.hops:
                     print_max_hops(cycle_info)
@@ -1461,13 +1921,16 @@ def main(args):
         if args.original:
             print_stats(stats, cycle_info, {})
         if args.neighbors:
-            print_neighbors(cycle_info)
+            print_neighbors(cycle_info, {})
             print_outgoing_neighbors(cycle_info)
         if args.hops:
             print_max_hops(cycle_info)
         save_stats()
     finally:
-        # Аккуратно останавливаем глобальный API-поток
+        if mqtt_stop_event is not None:
+            mqtt_stop_event.set()
+        if mqtt_thread is not None:
+            mqtt_thread.join(timeout=3)
         if api_stop_event is not None:
             api_stop_event.set()
         if api_thread is not None:
@@ -1511,6 +1974,9 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--debug', action='store_true',
                         help='Логировать пакеты, принятые observer напрямую (->OBS), '
                              f'в файл {DEBUG_LOG}')
+    parser.add_argument('--mqtt', action='store_true',
+                        help='Подписаться на MQTT MeshCoreTel (meshcoretel.ru), '
+                             'получать пакеты как от наблюдателя; первые N сообщений выводятся как образец формата')
     parser.add_argument('--reset', action='store_true',
                         help='Сбросить сохранённую статистику и начать с нуля')
     args = parser.parse_args()
