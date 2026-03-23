@@ -1,8 +1,13 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.3
+Version: 3.4
 
 Changelog:
+  v3.4 — Исправления выбора длины маршрута и debug-логирования
+    - API отключён по умолчанию: опрос MeshCoreTel только с флагом --api
+    - Исправлен выбор 2B/3B при длинных аномальных 1B-путях (сначала 3B, затем 2B)
+    - Исправлен выбор packed path_len для неоднозначных пакетов (устранено завышение hops)
+    - Debug: корректная привязка RX hash к U RAW и явная запись строки RAW: <hex> в debug-лог
   v3.3 — Маршруты 1/2/3 байта на хоп (1.14+), шум эфира, подсветка режимов
     - Парсинг packed path_len: mode+hops в одном байте (1/2/3 байта на хоп)
     - Корректная расшифровка GRP_TXT/GRP_DATA при 2B/3B маршрутах (выбор валидной раскладки)
@@ -10,10 +15,10 @@ Changelog:
     - Подавление спама DEBUG noise_floor в выводе; среднее noise_floor за цикл в таблице «СОСЕДИ»
     - Debug: связывание hash из RX со строкой U RAW и вывод RAW для «Пакеты только USB»
   v3.2 — Версия 3.2, опция -u для USB
-    - Нумерация и описание: API по умолчанию, USB только с -u/--usb
+    - Нумерация и описание: API только с --api, USB только с -u/--usb
     - Сравнение USB vs API выполняется только при -u (внутри _connect_and_run)
-  v3.1 — API по умолчанию, USB по опции -u
-    - По умолчанию опрос API meshcoretel.ru (без серийного порта)
+  v3.1 — API и USB по опциям
+    - Опрос API meshcoretel.ru только с --api (без серийного порта)
     - Опция -u/--usb: дополнительно прослушивать Observer по USB
   v3.0 — Поддержка маршрутов 2 байта на хоп (Meshcore 1.14+)
     - Константа PATH_BYTES_PER_HOP (1 или 2): режим парсинга path и TRACE
@@ -60,7 +65,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '3.3'
+__version__ = '3.4'
 
 import serial
 import time
@@ -592,11 +597,38 @@ def parse_raw(hex_str):
             use_new = False
         else:
             use_new = False
-            if new_ok and payload_type in (0x05, 0x06):
-            # Для GRP_* выбираем вариант, который даёт валидный формат ciphertext
-                if _looks_like_group_payload(new_payload) and not _looks_like_group_payload(old_payload):
+
+            # Если "старый" path_length слишком большой для реального 1B-маршрута,
+            # а packed-вариант валиден, это почти всегда 1.14+ пакет.
+            # Иначе в path попадает кусок payload и hops завышается.
+            if new_ok and old_valid and old_path_bytes_len > 63:
+                use_new = True
+
+            if (not use_new) and new_ok and payload_type in (0x05, 0x06):
+                # Для GRP_TXT/GRP_DATA избегаем привязки к адресу (3333...),
+                # выбираем вариант по "валидности" расшифровки/структуры payload.
+                looks_new = _looks_like_group_payload(new_payload)
+                looks_old = _looks_like_group_payload(old_payload)
+
+                if looks_new and not looks_old:
                     use_new = True
-            elif new_ok and new_bph in (2, 3):
+                elif looks_old and not looks_new:
+                    use_new = False
+                elif looks_new and looks_old:
+                    # Если оба варианта выглядят правдоподобно — пробуем реальную расшифровку (если есть crypto).
+                    if HAS_CRYPTO:
+                        dec_new = decrypt_group_msg(new_payload)
+                        dec_old = decrypt_group_msg(old_payload)
+                        if dec_new and not dec_old:
+                            use_new = True
+                        elif dec_old and not dec_new:
+                            use_new = False
+                        else:
+                            # Если обе расшифровки неуспешны или обе успешны — предпочитаем 2B/3B.
+                            use_new = new_bph in (2, 3)
+                    else:
+                        use_new = new_bph in (2, 3)
+            elif (not use_new) and new_ok and new_bph in (2, 3):
                 # Для остальных: если явно 2B/3B и всё укладывается — используем новый
                 use_new = True
 
@@ -616,6 +648,23 @@ def parse_raw(hex_str):
 
         # Группируем raw_path в хопы по path_bytes_per_hop (1/2/3)
         path = _decode_path(raw_path, path_bytes_per_hop)
+
+        # Защита от явной аномалии: если после разбора 1B получилось слишком много хопов,
+        # но длина пути кратна 2/3, это почти наверняка 2B/3B маршрут.
+        # Такая ситуация встречается на 1.14+ при неоднозначном path_len.
+        # Важно: сначала пробовать 3B, потом 2B — иначе при длине кратной 6 (напр. 282 B)
+        # ошибочно выбирается 2B и остаётся то же число «хопов», что и при ошибочном 1B
+        # (напр. 141 токенов вместо 94 трёхбайтных узлов).
+        if payload_type != 0x09 and path_bytes_per_hop == 1:
+            if len(path) > 63:
+                if len(raw_path) % 3 == 0:
+                    path_bytes_per_hop = 3
+                    path_hops = len(raw_path) // 3
+                    path = _decode_path(raw_path, 3)
+                elif len(raw_path) % 2 == 0:
+                    path_bytes_per_hop = 2
+                    path_hops = len(raw_path) // 2
+                    path = _decode_path(raw_path, 2)
 
         # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix
         dest = None
@@ -838,6 +887,12 @@ def parse_line(line, stats, debug):
         if debug['rx_lines'] <= 3:
             debug.setdefault('rx_samples', []).append(line)
         try:
+            # Тип пакета нужен дальше, в том числе для сопоставления hash<->U RAW.
+            ptype = None
+            if 'type=' in line:
+                type_part = line.split('type=')[1].split(',')[0]
+                ptype = int(type_part)
+
             global _usb_hashes_curr, _usb_hash_to_line_curr
             global _usb_hash_to_raw_curr
             if 'hash=' in line:
@@ -864,7 +919,8 @@ def parse_line(line, stats, debug):
 
                             if route_char and payload_len is not None:
                                 for entry in reversed(_recent_raw_usb):
-                                    if (entry.get('payload_type') == ptype and
+                                    if (ptype is not None and
+                                            entry.get('payload_type') == ptype and
                                             entry.get('route_char') == route_char and
                                             entry.get('payload_len') == payload_len):
                                         _usb_hash_to_raw_curr.setdefault(pkt_hash, {
@@ -886,8 +942,9 @@ def parse_line(line, stats, debug):
                 return
 
             # Извлекаем тип пакета (type=N)
-            type_part = line.split('type=')[1].split(',')[0]
-            ptype = int(type_part)
+            if ptype is None:
+                type_part = line.split('type=')[1].split(',')[0]
+                ptype = int(type_part)
 
             # Извлекаем адреса отправителя и получателя из квадратных скобок [src->dst]
             src = None
@@ -1082,6 +1139,8 @@ def parse_line(line, stats, debug):
                     log_line = f"{pkt_time} | {pkt_label} | hops={hops} path=[{path_str}]{dest_info}{obs_info}{dec_info}\n"
                 with open(DEBUG_LOG, 'a') as f:
                     f.write(log_line)
+                    # Явно сохраняем исходный hex U RAW для последующего разбора.
+                    f.write(f"  RAW: {hex_str}\n")
 
             # TRACE-пакеты: path содержит SNR, не узлы — пропускаем статистику
             is_trace = parsed.get('trace_route') is not None
@@ -1693,7 +1752,8 @@ def _connect_and_run(args, port, cycle_counter):
             print(f"Дешифрование каналов: {', '.join(KNOWN_CHANNEL_NAMES)}")
         else:
             print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
-        print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+        if args.api:
+            print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
         if DEBUG_MODE:
             print(f"Отладка ->OBS: пакеты пишутся в {DEBUG_LOG}")
         print(flush=True)
@@ -1845,19 +1905,22 @@ def _connect_and_run(args, port, cycle_counter):
 def main(args):
     """Главный цикл работы анализатора.
 
-    API MeshCoreTel опрашивается по умолчанию. С опцией -u/--usb дополнительно
-    подключается к Observer по серийному порту (USB).
+    API MeshCoreTel опрашивается только с опцией --api.
+    С опцией -u/--usb подключается Observer по серийному порту (USB).
     """
     port = args.port
     cycle_counter = [0]
 
-    api_stop_event = threading.Event()
-    api_thread = threading.Thread(
-        target=_api_poller,
-        args=(args.repeater, api_stop_event),
-        daemon=True,
-    )
-    api_thread.start()
+    api_stop_event = None
+    api_thread = None
+    if getattr(args, 'api', False):
+        api_stop_event = threading.Event()
+        api_thread = threading.Thread(
+            target=_api_poller,
+            args=(args.repeater, api_stop_event),
+            daemon=True,
+        )
+        api_thread.start()
 
     mqtt_thread = None
     mqtt_stop_event = None
@@ -1882,36 +1945,41 @@ def main(args):
                 if not need_reconnect:
                     break
 
-                print(f"Ожидание переподключения к {port}... (API продолжает работать)", flush=True)
+                reconnect_note = " (API продолжает работать)" if args.api else ""
+                print(f"Ожидание переподключения к {port}...{reconnect_note}", flush=True)
                 _wait_for_port(port)
                 time.sleep(2)
         else:
-            # Только API: циклы по таймеру, без серийного порта
-            print("Режим только API (без USB). Цикл статистики: каждые", CYCLE_TIME, "сек")
-            print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
-            print(flush=True)
-            while True:
-                cycle_counter[0] += 1
-                time.sleep(CYCLE_TIME)
-                cycle_info = {
-                    'num': cycle_counter[0],
-                    'lines_read': 0,
-                    'rx_this': 0,
-                    'tx_this': 0,
-                }
-                if args.original:
-                    print_stats(stats, cycle_info, {})
-                if args.neighbors:
-                    print_neighbors(cycle_info, {})
-                    print_outgoing_neighbors(cycle_info)
-                if args.hops:
-                    print_max_hops(cycle_info)
-                save_stats()
+            if args.api:
+                # Только API: циклы по таймеру, без серийного порта
+                print("Режим только API (без USB). Цикл статистики: каждые", CYCLE_TIME, "сек")
+                print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+                print(flush=True)
+                while True:
+                    cycle_counter[0] += 1
+                    time.sleep(CYCLE_TIME)
+                    cycle_info = {
+                        'num': cycle_counter[0],
+                        'lines_read': 0,
+                        'rx_this': 0,
+                        'tx_this': 0,
+                    }
+                    if args.original:
+                        print_stats(stats, cycle_info, {})
+                    if args.neighbors:
+                        print_neighbors(cycle_info, {})
+                        print_outgoing_neighbors(cycle_info)
+                    if args.hops:
+                        print_max_hops(cycle_info)
+                    save_stats()
+            else:
+                print("Нет источника данных. Укажите --api и/или -u/--usb.", flush=True)
 
     except KeyboardInterrupt:
         print("\n\nОстановлено пользователем")
         total_rx = sum(d['rx'] for d in stats.values())
         total_tx = sum(d['tx'] for d in stats.values())
+        last_cycle_num = cycle_counter[0] if 'cycle_counter' in locals() else 0
         cycle_info = {
             'num': 'ИТОГО',
             'lines_read': '-',
@@ -1921,7 +1989,9 @@ def main(args):
         if args.original:
             print_stats(stats, cycle_info, {})
         if args.neighbors:
-            print_neighbors(cycle_info, {})
+            neighbors_cycle_info = dict(cycle_info)
+            neighbors_cycle_info['num'] = f'ИТОГОВЫЙ цикл {last_cycle_num}'
+            print_neighbors(neighbors_cycle_info, {})
             print_outgoing_neighbors(cycle_info)
         if args.hops:
             print_max_hops(cycle_info)
@@ -1962,7 +2032,10 @@ if __name__ == "__main__":
                              '(тип, путь, канал для групповых сообщений)')
     parser.add_argument('-u', '--usb', action='store_true',
                         help='Прослушивать Observer по серийному порту (USB). '
-                             'Без этой опции работа только по API.')
+                             'Можно использовать вместе с --api.')
+    parser.add_argument('--api', action='store_true',
+                        help='Включить опрос API meshcoretel.ru '
+                             '(исходящие соседи для указанного префикса)')
     parser.add_argument('-p', '--port', default=PORT,
                         help=f'Серийный порт Observer-ноды (по умолчанию {PORT})')
     parser.add_argument('--repeater', default=REPEATER_PREFIX,
