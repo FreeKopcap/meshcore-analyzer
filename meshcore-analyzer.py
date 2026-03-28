@@ -1,8 +1,14 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.4
+Version: 3.5
 
 Changelog:
+  v3.5 — DIRECT TRACE по спецификации MeshCore 1.11+, мелкие правки
+    - TRACE: поле path на wire — только байты SNR; длина — path_len & 0x3F; маршрут в payload с байта 9
+    - Ширина хэша маршрута TRACE: flags & 3 → 1/2/4/8 байт на хоп (как в Mesh::onRecvPacket)
+    - Verbose, debug и учёт соседей (SNR→/SNR←) по типу 0x09 + DIRECT, не по «trace_route is not None»
+    - DIRECT TRACE: не подставлять первые 6 байт payload как dest (там tag/auth, не pubkey)
+    - MQTT: при разборе сырого hex задан path_bytes_per_hop (исправлено обращение к bph)
   v3.4 — Исправления выбора длины маршрута и debug-логирования
     - API отключён по умолчанию: опрос MeshCoreTel только с флагом --api
     - Исправлен выбор 2B/3B при длинных аномальных 1B-путях (сначала 3B, затем 2B)
@@ -65,7 +71,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '3.4'
+__version__ = '3.5'
 
 import serial
 import time
@@ -151,8 +157,10 @@ _api_origins_seen = set()
 # Серийный порт, к которому подключена нода Meshcore.
 # macOS: обычно /dev/cu.usbmodemXXXX или /dev/cu.usbserial-XXXX
 # Windows: COM24, COM3 и т.д.
-PORT = '/dev/cu.usbmodemE8F60ACB1A401'    # коричневый корпус
-# PORT = '/dev/cu.usbmodemE8F60ACB19781'      # черный корпус
+# PORT = '/dev/cu.usbmodemE8F60ACB1A401'    # коричневый корпус
+PORT = '/dev/cu.usbmodemE8F60ACB19781'      # черный корпус
+# PORT = '/dev/cu.usbmodemB0A604C57F281'    # Черный репитер (старый)
+
 BAUDRATE = 115200
 
 # Префикс hex-адресов ваших нод-компаньонов. Подсвечиваются зелёным в таблице.
@@ -467,7 +475,10 @@ def _process_mqtt_payload(topic, payload_bytes):
         parsed = parse_raw(raw_hex)
         if parsed and parsed.get('path'):
             path = parsed['path']
-            is_trace = parsed.get('trace_route') is not None
+            is_trace = (
+                parsed.get('payload_type') == 0x09
+                and parsed.get('route_type') in (0x02, 0x03)
+            )
             if not is_trace:
                 last = path[-1]
                 if is_repeater_token(last) and len(path) >= 2:
@@ -477,6 +488,7 @@ def _process_mqtt_payload(topic, payload_bytes):
                 if nb:
                     neighbor_stats[nb]['total'] += 1
                 hops = len(path)
+                bph = parsed.get('path_bytes_per_hop', 1)
                 if bph in (1, 2, 3):
                     rec = max_hops_by_bph.get(bph)
                     if rec is None or hops > rec.get('hops', 0):
@@ -649,6 +661,21 @@ def parse_raw(hex_str):
         # Группируем raw_path в хопы по path_bytes_per_hop (1/2/3)
         path = _decode_path(raw_path, path_bytes_per_hop)
 
+        # DIRECT TRACE: поле path на wire — только SNR (1 байт на ретрансляцию), не узлы.
+        # path_len как в Packet: младшие 6 бит — число байт SNR; в Mesh.cpp к path[] добавляется
+        # по одному байту (getSNR()*4). Маршрут — в payload после tag(4)+auth(4)+flags(1);
+        # размер хэша на хоп: 1 << (flags & 3) (см. Mesh::onRecvPacket TRACE, v1.11+).
+        if payload_type == 0x09 and route_type in (0x02, 0x03):
+            ph = int(path_length)
+            n_snr = ph & 0x3F
+            end_path = offset_after_len + n_snr
+            if end_path <= len(data):
+                raw_path = data[offset_after_len:end_path]
+                payload = data[end_path:]
+                path_bytes_per_hop = 1
+                path_hops = n_snr
+                path = [f"{b:02X}" for b in raw_path]
+
         # Защита от явной аномалии: если после разбора 1B получилось слишком много хопов,
         # но длина пути кратна 2/3, это почти наверняка 2B/3B маршрут.
         # Такая ситуация встречается на 1.14+ при неоднозначном path_len.
@@ -666,47 +693,25 @@ def parse_raw(hex_str):
                     path_hops = len(raw_path) // 2
                     path = _decode_path(raw_path, 2)
 
-        # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix
+        # DIRECT-пакеты: первые 6 байт payload — destination pubkey prefix (не TRACE)
         dest = None
-        if route_type in (0x02, 0x03) and len(payload) >= 6:
+        if route_type in (0x02, 0x03) and len(payload) >= 6 and payload_type != 0x09:
             dest = payload[:6].hex().upper()
 
         # TRACE-пакеты: path содержит SNR (×4) на каждом хопе, а не узлы;
-        # маршрут трассировки — в конце payload.
-        # В 1.14+ размер адреса (1/2/3 байта) для TRACE задаётся отдельным байтом
-        # в payload сразу после dest[6] + meta[3].
+        # маршрут — в payload после tag(4)+auth(4)+flags(1); flags&3 — log2 ширины хэша (1/2/4/8 B).
         trace_route = None
         trace_snr = None
         if payload_type == 0x09 and route_type in (0x02, 0x03):
-            # В TRACE поле path всегда содержит SNR (по 1 байту на хоп).
-            snr_count = int(path_length)  # это именно число SNR-байт
-            snr_bytes = raw_path[:snr_count] if raw_path else b''
-            trace_snr = [(b - 256 if b > 127 else b) / 4.0 for b in snr_bytes]
+            trace_snr = [(b - 256 if b > 127 else b) / 4.0 for b in raw_path]
+            trace_route = []
             if len(payload) > 9:
-                # Встречаются два варианта TRACE-пэйлоада:
-                #  1) dest[6] + meta[3] (где meta[2] = mode 0/1/2) + route_bytes...
-                #  2) dest[6] + meta[3] + mode[1] + route_bytes...
-                mode = None
-                route_start = 9  # после dest[6]+meta[3]
-                if len(payload) > 10 and payload[9] in (0, 1, 2):
-                    # вариант 2: отдельный mode-байт
-                    mode = payload[9]
-                    route_start = 10
-                elif payload[8] in (0, 1, 2):
-                    # вариант 1: mode зашит в последнем байте meta
-                    mode = payload[8]
-                    route_start = 9
-                route_bph = (mode + 1) if mode in (0, 1, 2) else 1
-                raw_route = payload[route_start:]
-                # Если mode не определился, пробуем эвристику: у вашего репитера ключ (33)+,
-                # поэтому в 2B/3B режимах часто встречаются байты 33 33 (или 33 33 33).
-                if route_bph == 1 and raw_route:
-                    if len(raw_route) % 3 == 0 and b'\x33\x33\x33' in raw_route:
-                        route_bph = 3
-                    elif len(raw_route) % 2 == 0 and b'\x33\x33' in raw_route:
-                        route_bph = 2
+                path_sz = payload[8] & 0x03
+                route_bph = 1 << path_sz
+                if route_bph > 8:
+                    route_bph = 8
+                raw_route = payload[9:]
                 if route_bph > 1 and len(raw_route) >= route_bph:
-                    trace_route = []
                     for i in range(0, len(raw_route), route_bph):
                         chunk = raw_route[i:i + route_bph]
                         if len(chunk) != route_bph:
@@ -1020,6 +1025,10 @@ def parse_line(line, stats, debug):
         hex_str = line.split('U RAW:')[1].strip()
         parsed = parse_raw(hex_str)
         if parsed:
+            is_direct_trace = (
+                parsed['payload_type'] == 0x09
+                and parsed['route_type'] in (0x02, 0x03)
+            )
             pkt_label = f"{parsed['route_name']} {parsed['payload_name']}"
             path_str = ','.join(parsed['path']) if parsed['path'] else '-'
             hops = len(parsed['path'])
@@ -1064,8 +1073,8 @@ def parse_line(line, stats, debug):
                     direct_to_obs = True
 
             # TRACE: собираем SNR→/SNR←, считаем попытки/успехи
-            if parsed.get('trace_route') is not None:
-                tr = parsed['trace_route']
+            if is_direct_trace:
+                tr = parsed.get('trace_route') or []
                 ts = parsed.get('trace_snr') or []
                 if (len(tr) >= 3 and is_repeater_token(tr[0].upper())):
                     nb = tr[1].upper()
@@ -1090,17 +1099,21 @@ def parse_line(line, stats, debug):
                     color, end = "", ""
                 obs_tag = f" {YELLOW}[OBS]{RESET}{color}" if direct_to_obs else ""
 
-                if parsed.get('trace_route') is not None:
-                    route_str = '→'.join(parsed['trace_route']) if parsed['trace_route'] else '?'
-                    snr_str = ','.join(f"{s:.2f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
-                    # Для TRACE размер адреса может быть 1/2/3 байта; косвенно видно по длине токенов.
+                if is_direct_trace:
+                    tr = parsed.get('trace_route') or []
+                    route_str = '→'.join(tr) if tr else '?'
+                    ts = parsed.get('trace_snr') or []
+                    snr_str = ','.join(f"{s:.2f}" for s in ts) if ts else '-'
+                    # Ширина хэша в маршруте TRACE: 1<< (flags&3) байт → 2/4/6/8 hex на токен.
                     mode_tag = ""
-                    if parsed['trace_route']:
-                        tok_len = len(parsed['trace_route'][0])
+                    if tr:
+                        tok_len = len(tr[0])
                         if tok_len == 4:
                             mode_tag = f" {BLUE}{BOLD}[2B]{RESET}"
                         elif tok_len == 6:
                             mode_tag = f" {MAGENTA}{BOLD}[3B]{RESET}"
+                        elif tok_len == 8:
+                            mode_tag = f" {CYAN}{BOLD}[4B]{RESET}"
                     print(f"{CYAN}    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]{mode_tag}{RESET}", flush=True)
                 else:
                     # Подсветка нестандартных маршрутов: 2B/3B на хоп (прошивки 1.14+)
@@ -1131,9 +1144,11 @@ def parse_line(line, stats, debug):
                 dec_info = ""
                 if decrypted:
                     dec_info = f" | {decrypted['channel']}: {decrypted['text']}"
-                if parsed.get('trace_snr') is not None:
-                    route_str = '→'.join(parsed['trace_route']) if parsed.get('trace_route') else '?'
-                    snr_str = ','.join(f"{s:.2f}" for s in parsed['trace_snr']) if parsed['trace_snr'] else '-'
+                if is_direct_trace:
+                    tr = parsed.get('trace_route') or []
+                    route_str = '→'.join(tr) if tr else '?'
+                    ts = parsed.get('trace_snr') or []
+                    snr_str = ','.join(f"{s:.2f}" for s in ts) if ts else '-'
                     log_line = f"{pkt_time} | {pkt_label} | route=[{route_str}] SNR=[{snr_str}]\n"
                 else:
                     log_line = f"{pkt_time} | {pkt_label} | hops={hops} path=[{path_str}]{dest_info}{obs_info}{dec_info}\n"
@@ -1143,7 +1158,7 @@ def parse_line(line, stats, debug):
                     f.write(f"  RAW: {hex_str}\n")
 
             # TRACE-пакеты: path содержит SNR, не узлы — пропускаем статистику
-            is_trace = parsed.get('trace_route') is not None
+            is_trace = is_direct_trace
             if not is_trace:
                 for node_hash in parsed['path']:
                     stats[node_hash].setdefault('hops_seen', 0)
