@@ -1,0 +1,35 @@
+# Пример для systemd на одной машине с Mosquitto.
+#
+# 1. Скопируйте репозиторий на сервер (или один файл meshcore-mqtt-bridge.py + uv + paho-mqtt).
+# 2. Подставьте пути и пользователя:
+#    sudo install -m 644 meshcore-mqtt-bridge.service.example /etc/systemd/system/meshcore-mqtt-bridge.service
+#    sudo nano /etc/systemd/system/meshcore-mqtt-bridge.service   # WorkingDirectory, User, ExecStart
+# 3. Если meshcoretel принимает только WebSocket, замените в ExecStart на:
+#    ... --remote-ws --remote-port 9001 ...
+# 4. sudo systemctl daemon-reload && sudo systemctl enable --now meshcore-mqtt-bridge
+#
+# Лог: journalctl -u meshcore-mqtt-bridge -f
+
+[Unit]
+Description=MeshCore MQTT bridge (local Mosquitto -> meshcoretel.ru)
+After=network-online.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+# Каталог, где лежит meshcore-mqtt-bridge.py
+WorkingDirectory=/opt/Meshcore-Analyzer
+User=YOUR_LINUX_USER
+Group=YOUR_LINUX_USER
+# Установите uv/venv при необходимости; иначе полный путь к python3 с paho-mqtt
+ExecStart=/usr/bin/uv run python meshcore-mqtt-bridge.py \
+  --local-host 127.0.0.1 --local-port 1883 \
+  --local-username YOUR_LOCAL_MQTT_USER --local-password YOUR_LOCAL_MQTT_PASS \
+  --remote-host meshcoretel.ru --remote-port 1883 \
+  --remote-username meshcore --remote-password meshcore \
+  --stats-every 60 -v
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -13,7 +13,7 @@
 - **Таблица исходящих соседей** — через кого уходят пакеты (API, TRACE, ответы ботов)
 - **Отладка** — полный лог всех пакетов в файл (`-d`)
 - **Рекорд хопов** — пакет с максимальным числом хопов, его маршрут и расшифровка
-- **Дешифрование каналов** — расшифровка групповых сообщений (GRP_TXT/GRP_DATA) публичных каналов (AES-128-ECB)
+- **Дешифрование каналов** — GRP_TXT/GRP_DATA: канал **Public** по общему PSK MeshCore (HMAC+AES как в прошивке), остальные из списка — по `SHA256(имя)[:16]`
 - **Автоматическое переподключение** — при потере USB-соединения ждёт возвращения порта и продолжает работу
 - **Сохранение статистики** — накопленные данные сохраняются в `meshcore-stats.json` между запусками
 - **Декодирование RAW-пакетов** — парсинг заголовка MeshCore v1: route type, payload type, path (1/2/3 байта на хоп для 1.14+)
@@ -57,16 +57,18 @@ MQTT_PASSWORD = 'meshcore'
 MQTT_TOPICS = ['meshcore/+/+/packets', 'meshcore/+/+/status']
 MQTT_TOPICS_IATA = ['meshcore/MOW/+/packets', 'meshcore/MOW/+/status']  # ваш IATA
 
-# Известные публичные каналы для расшифровки
+# Канал Public — фиксированный PSK (как в MeshCore companion_radio / simple_secure_chat)
+PUBLIC_GROUP_PSK_B64 = 'izOH6cXN6mrJ5e26oRXNcg=='
+
+# Остальные именованные каналы: AES-ключ = SHA256(имя)[:16], хеш на wire = SHA256(ключа)[0]
 KNOWN_CHANNEL_NAMES = [
-    'Public',
     '#connections',
     '#robot',
     ...
 ]
 ```
 
-Ключи каналов вычисляются автоматически: `SHA256(имя)[:16]`. Добавьте свои каналы в список.
+Для **Public** используется тот же Base64-PSK, что в примерах MeshCore; для строк из `KNOWN_CHANNEL_NAMES` ключи по-прежнему из `SHA256(имя)[:16]`.
 
 Перед запуском отключите веб-консоль (flasher.meshcore.dev) от серийного порта.
 
@@ -78,8 +80,9 @@ KNOWN_CHANNEL_NAMES = [
 # Только API: таблицы соседей и исходящих (каждые 60 сек)
 uv run meshcore-analyzer.py -n
 
-# С USB: полный лог с порта + сравнение USB vs API в отладке
+# С USB: полный лог с порта (-d). Сравнение USB vs API в -d только вместе с --api
 uv run meshcore-analyzer.py -unvd --hops
+uv run meshcore-analyzer.py -unvd --api --hops
 
 # Отслеживать соседей другого ретранслятора
 uv run meshcore-analyzer.py -n --repeater A7
@@ -93,9 +96,48 @@ uv run meshcore-analyzer.py -u -p /dev/cu.usbmodem1234
 # Подписка на MQTT MeshCoreTel (первые N сообщений — образец формата)
 uv run meshcore-analyzer.py -n --mqtt
 
+# Только локальный брокер (наблюдатель шлёт не на meshcoretel.ru, а на ваш Mosquitto: set mqtt.server …, port 1883)
+uv run meshcore-mqtt-bridge.py -v
+uv run meshcore-analyzer.py -n --mqtt --mqtt-tcp --mqtt-broker 127.0.0.1 --mqtt-port 1883
+
 # Сбросить накопленную статистику и отладочный лог
 uv run meshcore-analyzer.py --reset
 ```
+
+### Локальный брокер и мост на MeshCoreTel
+
+Прошивка наблюдателя задаёт **один** MQTT-брокер (`set mqtt.server`, `set mqtt.port`, …). Если ноде недоступен USB, а на карте нужен поток на [meshcoretel.ru](https://meshcoretel.ru):
+
+1. Поднимите свой брокер (например Mosquitto) и откройте порт **1883** с логином/паролем по желанию.
+2. На наблюдателе: **`set mqtt.server`** и **`set mqtt.port`** под ваш брокер (часто 1883 TCP). Если на Mosquitto другие учётные записи — **`set mqtt.username`** / **`set mqtt.password`**. Остальное можно не трогать: **`mqtt.iata`**, **`mqtt.packets on`**, **`mqtt.status on`** оставьте как при публикации на meshcoretel (тот же формат топиков). Если прошивка поддерживает только TLS или WebSocket, брокер должен принимать тот же режим, что и раньше, иначе поменяйте порт/тип подключения на ноде.
+3. На машине с доступом и к вашему брокеру, и в интернет запустите **мост** (скрипт — не брокер, а два MQTT-клиента):  
+   `uv run meshcore-mqtt-bridge.py --local-host … --remote-host meshcoretel.ru`  
+   Он подписывается на `meshcore/#` у вас и **пересылает каждое сообщение на meshcoretel** с тем же topic и телом (QoS/retain сохраняются). Если meshcoretel принимает только WebSocket, добавьте `--remote-ws --remote-port 9001`.  
+**Анализатор** мост не запускает: у него своё MQTT-подключение к **тому же** Mosquitto — вы получаете и пересылку на meshcoretel, и статистику в скрипте за счёт **двух подписчиков** на одном брокере.
+4. Анализатор подключается к **локальному** брокеру:  
+   `uv run meshcore-analyzer.py -n --mqtt --mqtt-tcp --mqtt-broker <хост-где-mosquitto> --mqtt-port 1883`  
+   (при необходимости `--mqtt-username` / `--mqtt-password`).
+
+**Мост на том же хосте, что Mosquitto** — сначала вручную:
+
+```bash
+cd /путь/к/Meshcore-Analyzer
+uv pip install paho-mqtt   # если ещё не ставили
+uv run python meshcore-mqtt-bridge.py \
+  --local-host 127.0.0.1 --local-port 1883 \
+  --local-username meshcore --local-password meshcore \
+  --remote-host meshcoretel.ru --remote-port 1883 \
+  --remote-username meshcore --remote-password meshcore \
+  -v --stats-every 60
+```
+
+Ожидаются строки `local OK`, `remote OK` и рост `forwarded` в `[bridge] stats`. Автозапуск: отредактируйте `meshcore-mqtt-bridge.service.example` (WorkingDirectory, User), установите как `/etc/systemd/system/meshcore-mqtt-bridge.service`, затем `systemctl enable --now meshcore-mqtt-bridge`.
+
+Топики совпадают с принятым в стеке meshcoretomqtt: `meshcore/{IATA}/{public_key}/packets` и `…/status` (см. константы `MQTT_TOPICS` в скрипте).
+
+**Проверка цепочки:** (1) на брокере с мостом должно расти `forwarded` в строке `[bridge] stats` раз в `--stats-every` сек; `remote=UP`; `dropped_remote_down` и `publish_fail` лучше держать нулевыми. (2) Второй терминал: подписка на MeshCoreTel тем же логином (если ACL разрешает):  
+`mosquitto_sub -h meshcoretel.ru -p 1883 -u meshcore -P meshcore -t 'meshcore/MOW/#' -v`  
+или с WS — отдельным клиентом под ваш порт. (3) Публичный поток: [meshcoretel.ru](https://meshcoretel.ru) / API пакетов — появление ваших нод с задержкой. (4) Локально: `uv run meshcore-analyzer.py -n --mqtt --mqtt-tcp --mqtt-broker …` — если считается статистика и в логе есть `[MQTT] получено сообщение`, нода доходит до вашего брокера.
 
 ## Опции
 
@@ -106,7 +148,11 @@ uv run meshcore-analyzer.py --reset
 | `-n`, `--neighbors` | Таблицы входящих и исходящих соседей |
 | `--hops` | Пакет-рекордсмен по числу хопов |
 | `-u`, `--usb` | Прослушивать Observer по серийному порту (USB) |
-| `--mqtt` | Подписка на MQTT meshcoretel.ru; первые N сообщений — образец формата |
+| `--mqtt` | Подписка на MQTT; по умолчанию хост из `MQTT_SERVER` (часто meshcoretel.ru) |
+| `--mqtt-tcp` | TCP вместо WebSockets (локальный брокер, порт 1883) |
+| `--mqtt-broker HOST` | Хост MQTT |
+| `--mqtt-port N` | Порт (для WS — например 9001, для TCP — 1883) |
+| `--mqtt-username` / `--mqtt-password` | Учётные данные брокера |
 | `--repeater XX` | Префикс ретранслятора для поиска через API (по умолчанию `33`) |
 | `--bots` | Искать исходящих соседей через ответы ботов в каналах (при `-u`) |
 | `-d`, `--debug` | Логировать пакеты в файл `meshcore-debug.log` |
