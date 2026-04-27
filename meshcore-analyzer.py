@@ -29,6 +29,14 @@ Changelog:
       не отрезает каждый хоп до последних 2 hex — теперь сохраняем исходную
       длину 2/4/6 hex, так что is_my_repeater отрабатывает корректно для
       2B/3B путей; bph для max_hops_by_bph определяется по длине первого хопа
+    - extract_outgoing_neighbors больше не зависит от имён ботов и адресатов:
+      константы PATHBOT_SENDER='AetherByte🤖' и MY_COMPANIONS=['Kopcap V4️⃣',...]
+      удалены. Паттерн 2 срезает любой префикс "Имя_отправителя: " и ловит
+      "HEX: Описание" для любого источника; Паттерны 3/4 принимают ответ
+      ЛЮБОМУ адресату @[...] (имя не важно). Единственный критерий
+      во всех паттернах — путь начинается с одного из ваших репитеров,
+      а второй хоп — нет (защита от ложных срабатываний и от перекрёстной
+      пересылки между своими)
   v3.6 — Устойчивый MQTT-коннект, чище вывод в MQTT-only
     - Ретрай первичного connect() с видимым логом "попытка #N" (каждые 5с)
     - reconnect_delay_set(1..30s) для авто-реконнекта paho после установленной сессии
@@ -70,7 +78,6 @@ Changelog:
     - Константа PATH_BYTES_PER_HOP (1 или 2): режим парсинга path и TRACE
     - Парсинг path/trace_route при 2 байтах на хоп; число хопов = len(path)
     - Исходящие соседи из ответов ботов: ack@[имя] и @[имя] (оба формата)
-    - MY_COMPANIONS: имена компаньонов для маршрутов без префикса репитера
     - Регулярки в extract_outgoing_neighbors поддерживают 2 и 4 hex на хоп
   v2.2 — SNR соседей из TRACE, полный debug-лог
     - Столбцы SNR→/SNR← в таблице соседей (средний SNR туда/обратно из TRACE)
@@ -239,11 +246,6 @@ OBSERVER_ORIGINS = ['MO Zvenigorod Room']
 # Виртуальный адрес для пакетов без конкретного источника (широковещательные).
 BROADCAST_NODE = 'BCAST'
 
-# Имя бота, передающего маршруты в формате "XX: Описание репитера" (паттерн 2).
-PATHBOT_SENDER = 'AetherByte\U0001f916'  # AetherByte🤖
-
-# Имена ваших компаньонов для обработки ack@[...] без префикса репитера.
-MY_COMPANIONS = ['Kopcap V4️⃣', 'Kopcap 1️⃣1️⃣4️⃣']
 
 # MQTT MeshCoreTel — настройки для подписки на поток пакетов (как при set mqtt.* на наблюдателе).
 # Подключение к тому же брокеру, куда наблюдатель отправляет пакеты.
@@ -921,8 +923,10 @@ def extract_outgoing_neighbors(text):
     """Извлекает исходящих соседей из расшифрованного группового сообщения.
 
     Паттерн 1: "Found N unique path(s):" с последующими строками hex через запятую.
-    Паттерн 2: Сообщения от PATHBOT_SENDER с маршрутом в формате "XX: Описание".
-               Сообщения, начинающиеся с "..." — продолжения, игнорируются.
+    Паттерн 2: Маршрут построчно "HEX: Описание" (≥2 строки подряд). Имя
+               отправителя не важно: автоматически срезается префикс
+               "Имя_отправителя: " в начале текста.
+               Строки, начинающиеся с "..." — продолжения, игнорируются.
     Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX,YY,..." — хопы сразу за именем.
     Паттерн 4: "@[имя] <текст> = XX,YY,..." — между именем и хопами произвольный
                текст и знак '='. Например, ответ от робота VAO Hekru:
@@ -931,9 +935,8 @@ def extract_outgoing_neighbors(text):
     Во всех случаях хопы — 2/4/6 hex (1B/2B/3B per hop). Если первый хоп —
     один из ваших репитеров (см. MY_REPEATERS_HEX), второй считается исходящим
     соседом. Если второй хоп тоже один из ваших репитеров (перекрёстная
-    служебка), пропускаем. В Паттернах 3/4 дополнительно: если первый хоп НЕ
-    мой репитер, но name в MY_COMPANIONS — первый хоп считается соседом
-    (компаньон услышал соседа напрямую).
+    служебка), пропускаем. Имена ботов и адресатов в Паттернах 2/3/4 не
+    важны: критерий принадлежности — только префикс пути.
 
     Args:
         text: расшифрованный текст сообщения
@@ -958,59 +961,67 @@ def extract_outgoing_neighbors(text):
             else:
                 break
 
-    # Паттерн 2: сообщения от PATHBOT_SENDER "XX: Описание" / "XXXX: ..." / "XXXXXX: ..."
-    # (2/4/6 hex на хоп для 1B/2B/3B).
+    # Паттерн 2: маршрут построчно "HEX: Описание" (2/4/6 hex на хоп для 1B/2B/3B).
+    # Не привязан к конкретному имени бота — срезаем любой префикс
+    # "Имя_отправителя: " в начале текста (всё до первого ': ' вне переноса).
+    # Дальше собираем подряд идущие "HEX: " префиксы (пустые строки
+    # пропускаем). Первый нестыковочный non-blank после старта — стоп.
+    # Если первая non-blank строка начинается с "..." — это продолжение,
+    # пропускаем весь паттерн. Критерий "первый — мой репитер, второй —
+    # нет" защищает от ложных срабатываний на чат-сообщениях.
     hex_prefix = r'[0-9a-fA-F]{2,6}'
-    sender_prefix = PATHBOT_SENDER + ': '
-    if text.startswith(sender_prefix):
-        msg = text[len(sender_prefix):]
-        lines = msg.split('\n')
-        if lines and not lines[0].strip().startswith('...'):
-            prefixes = []
-            for line in lines:
-                m = re.match(r'^(' + hex_prefix + r'):\s', line.strip())
-                if m:
-                    prefixes.append(m.group(1).upper())
-            if (len(prefixes) >= 2 and is_my_repeater(prefixes[0])
-                    and not is_my_repeater(prefixes[1])):
-                neighbors.append(prefixes[1])
+    sender_match = re.match(r'^([^:\n]+):\s', text)
+    # Если "отправитель" сам выглядит как hex-хоп (т.е. сообщение пришло без
+    # префикса имени и сразу начинается с "HEX:"), префикс НЕ срезаем,
+    # иначе потеряем первый хоп пути.
+    if sender_match and not re.fullmatch(r'[0-9a-fA-F]{2,6}', sender_match.group(1).strip()):
+        msg = text[sender_match.end():]
+    else:
+        msg = text
+    lines = msg.split('\n')
+    first_nonempty = next((s for s in (l.strip() for l in lines) if s), '')
+    if first_nonempty and not first_nonempty.startswith('...'):
+        prefixes = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue   # пустые строки игнорируем
+            m = re.match(r'^(' + hex_prefix + r'):\s', s)
+            if m:
+                prefixes.append(m.group(1).upper())
+            elif prefixes:
+                break   # первый non-prefix non-empty после старта — стоп
+        if (len(prefixes) >= 2 and is_my_repeater(prefixes[0])
+                and not is_my_repeater(prefixes[1])):
+            neighbors.append(prefixes[1])
 
     # Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX,YY,..." сразу после имени.
     # Хопы 2/4/6 hex (1B/2B/3B per hop, MeshCore 1.14+).
-    # Если путь начинается с одного из ваших репитеров — берём второй хоп
-    # (но только если он сам не один из ваших репитеров).
-    # Если нет, но имя в MY_COMPANIONS — первый хоп (репитер считается
-    # дублем, компаньон услышал соседа напрямую).
+    # Принимаем ответ ЛЮБОМУ адресату (имя не важно). Критерий — путь
+    # начинается с одного из ваших репитеров и второй хоп НЕ ваш репитер.
     m = re.search(
-        r'(?:ack)?@\[(.*?)\]\s+([\da-fA-F]{2,6}(?:,\s*[\da-fA-F]{2,6})+)',
+        r'(?:ack)?@\[[^\]]*\]\s+([\da-fA-F]{2,6}(?:,\s*[\da-fA-F]{2,6})+)',
         text,
     )
     if m:
-        name = m.group(1)
-        hops = [h.strip().upper() for h in m.group(2).split(',')]
+        hops = [h.strip().upper() for h in m.group(1).split(',')]
         if (len(hops) >= 2 and is_my_repeater(hops[0])
                 and not is_my_repeater(hops[1])):
             neighbors.append(hops[1])
-        elif hops and name in MY_COMPANIONS and not is_my_repeater(hops[0]):
-            neighbors.append(hops[0])
 
     # Паттерн 4: ответ робота с произвольным текстом и '=' перед путём:
     #   "@[name] pong [2b 13h] = XX,YY,..."
     #   "@[name] <любой текст без '=' и переноса> = XX,YY,..."
-    # Логика та же, что в Паттерне 3: первый хоп — мой репитер → второй сосед;
-    # иначе name в MY_COMPANIONS → первый хоп.
+    # Имя адресата не важно — то же требование к пути, что в Паттерне 3.
     m = re.search(
-        r'@\[(.*?)\][^\n=]*=\s*([\da-fA-F]{2,6}(?:,\s*[\da-fA-F]{2,6})+)',
+        r'@\[[^\]]*\][^\n=]*=\s*([\da-fA-F]{2,6}(?:,\s*[\da-fA-F]{2,6})+)',
         text,
     )
     if m:
-        name = m.group(1)
-        hops = [h.strip().upper() for h in m.group(2).split(',')]
+        hops = [h.strip().upper() for h in m.group(1).split(',')]
         if (len(hops) >= 2 and is_my_repeater(hops[0])
                 and not is_my_repeater(hops[1])):
             neighbors.append(hops[1])
-        elif hops and name in MY_COMPANIONS and not is_my_repeater(hops[0]):
-            neighbors.append(hops[0])
 
     return neighbors
 
