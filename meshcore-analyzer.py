@@ -29,6 +29,18 @@ Changelog:
       не отрезает каждый хоп до последних 2 hex — теперь сохраняем исходную
       длину 2/4/6 hex, так что is_my_repeater отрабатывает корректно для
       2B/3B путей; bph для max_hops_by_bph определяется по длине первого хопа
+    - DIRECT TRACE: исправлена статистика по соседям. Три бага:
+      1) tr=[3434,3333,5A94,...] выкидывался целиком, потому что nb=tr[1]=3333
+         попадал под cross-mention skip. Теперь, как и в outgoing, идём
+         через всех своих в начале tr и берём первый «чужой» как соседа.
+      2) trace_out_sum использовал ts[1] вместо корректного ts[i-1] (где i —
+         длина пробега своих); для round-trip [3333,5A94,3333] это писало
+         в "SNR→" значение return-направления.
+      3) trace_ok / trace_in_sum фиксировались только при len(ts)>=len(tr),
+         что для round-trip из 3 хопов с 2 SNR никогда не срабатывало —
+         в таблице висело "0/N", хотя все трассы возвращались. Условие
+         поправлено на корректный round-trip-критерий: tr[-1] — наш,
+         len(ts) >= len(tr)-1.
     - extract_outgoing_neighbors: цепочка своих репитеров в начале пути больше
       не выкидывается целиком. Если путь идёт [343434, 333333, ABCD, ...] —
       пробегаем через всех своих подряд и берём ABCD как исходящего соседа,
@@ -1125,19 +1137,30 @@ def _process_parsed_raw(
     if is_direct_trace:
         tr = parsed.get('trace_route') or []
         ts = parsed.get('trace_snr') or []
-        if len(tr) >= 3 and is_my_repeater(tr[0].upper()):
-            nb = tr[1].upper()
-            # Если второй хоп тоже наш репитер — это перекрёстная служебная
-            # пересылка между нашими нодами, не сосед.
-            if not is_my_repeater(nb):
+        # Соглашения про SNR-байты в TRACE: индекс k в ts — это SNR, который
+        # tr[k+1] зафиксировал, принимая пакет от tr[k] (т.е. источник tr[0]
+        # ничего не добавляет). Поэтому для нашего соседа nb=tr[i], где i —
+        # длина пробега наших репитеров в начале tr, ts[i-1] и есть «как
+        # сосед услышал нашу последнюю свою ноду» = SNR→ nb (forward).
+        # Для round-trip (tr[-1] — наш) ts[-1] — «как наш репитер услышал
+        # ответный сигнал» = SNR← nb (return). Длина полностью завершённого
+        # round-trip = len(tr)-1 SNR-байт.
+        if len(tr) >= 2 and is_my_repeater(tr[0].upper()):
+            i = 0
+            while i < len(tr) and is_my_repeater(tr[i].upper()):
+                i += 1
+            if 0 < i < len(tr):
+                nb = tr[i].upper()
                 if len(ts) == 0:
                     neighbor_stats[nb]['trace_attempts'] += 1
-                if len(ts) >= 2:
+                if len(ts) >= i:
                     neighbor_stats[nb]['total'] += 1
-                    neighbor_stats[nb]['trace_out_sum'] += ts[1]
+                    neighbor_stats[nb]['trace_out_sum'] += ts[i - 1]
                     neighbor_stats[nb]['trace_out_count'] += 1
                     outgoing_stats[nb]['total'] += 1
-                if len(ts) >= len(tr):
+                if (is_my_repeater(tr[-1].upper())
+                        and len(ts) >= len(tr) - 1
+                        and len(ts) > i - 1):
                     neighbor_stats[nb]['trace_ok'] += 1
                     neighbor_stats[nb]['trace_in_sum'] += ts[-1]
                     neighbor_stats[nb]['trace_in_count'] += 1
