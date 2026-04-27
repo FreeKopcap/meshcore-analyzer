@@ -1,8 +1,25 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.6
+Version: 3.7
 
 Changelog:
+  v3.7 — Несколько ваших репитеров (3-байтные адреса), без перекрёстных соседей
+    - MY_REPEATERS_HEX: список 3-байтных адресов ваших репитеров
+      (по умолчанию ['333333','343434']) вместо одной 1-байтной константы
+      REPEATER_PREFIX. Можно переопределить через --repeaters
+    - is_my_repeater(token) сравнивает токены 2/4/6 hex с префиксом
+      соответствующей длины из MY_REPEATERS_HEX. Убраны ложные срабатывания
+      при bph=3 на чужих узлах вида 34xxxx, попадавшие под старый
+      startswith(REPEATER_PREFIX)
+    - Пакеты, ретранслированные между моими же репитерами (33 → 34, 34 → 33),
+      больше не учитываются ни в neighbor_stats, ни в outgoing_stats —
+      это перекрёстная служебная пересылка, а не сосед. Применяется в
+      path FLOOD, TRACE, API и в extract_outgoing_neighbors
+    - CLI: --repeater (одиночный префикс) заменён на --repeaters
+      (список через запятую). API ищет любой из адресов
+    - В MQTT-only режиме (без -u/--usb) скрыт блок «ДИАГНОСТИКА ПАРСИНГА»
+      и связанные примеры RX/RAW/ignored — они всегда показывают нули,
+      т.к. parse_line() для USB-лога не вызывается
   v3.6 — Устойчивый MQTT-коннект, чище вывод в MQTT-only
     - Ретрай первичного connect() с видимым логом "попытка #N" (каждые 5с)
     - reconnect_delay_set(1..30s) для авто-реконнекта paho после установленной сессии
@@ -85,7 +102,7 @@ Changelog:
     - Парсинг RAW-пакетов MeshCore v1
 """
 
-__version__ = '3.5'
+__version__ = '3.7'
 
 import serial
 import time
@@ -127,18 +144,29 @@ BOLD = '\033[1m'
 # ===============================================================
 
 
-def is_repeater_token(token: str) -> bool:
-    """Возвращает True, если токен в path относится к вашему репитеру.
+def is_my_repeater(token: str) -> bool:
+    """Возвращает True, если hex-токен в path/trace_route относится к одному
+    из ваших репитеров (см. MY_REPEATERS_HEX).
 
-    Логика:
-      - начинается с REPEATER_PREFIX (обычный случай);
-      - или состоит только из повторяющихся байт 0x33: 33,3333,333333,...
+    В пакете токен может быть 2 hex (bph=1), 4 hex (bph=2) или 6 hex (bph=3)
+    символов. Сравниваем с префиксом длины n каждого полного адреса из
+    MY_REPEATERS_HEX. Например для адреса 343434:
+      - токен '34'      → True (1B-маршрут);
+      - токен '3434'    → True (2B-маршрут);
+      - токен '343434'  → True (3B-маршрут);
+      - токен '343535'  → False;
+      - токен '34xxxx'  → False (чужой узел с тем же первым байтом).
+
+    Длины, не входящие в {2,4,6} (например, после нормализации MQTT) матчим
+    в обе стороны, чтобы не потерять совпадение.
     """
+    if not token:
+        return False
     t = token.upper()
-    if t.startswith(REPEATER_PREFIX.upper()):
-        return True
-    # Повторяющиеся "33" (любая длина, кратная 2)
-    return len(t) >= 2 and len(t) % 2 == 0 and all(t[i:i+2] == '33' for i in range(0, len(t), 2))
+    n = len(t)
+    if n in (2, 4, 6):
+        return any(rep[:n] == t for rep in MY_REPEATERS_HEX)
+    return any(rep.startswith(t) or t.startswith(rep) for rep in MY_REPEATERS_HEX)
 
 
 # Наборы hash-пакетов для сравнения USB vs API.
@@ -181,15 +209,17 @@ BAUDRATE = 115200
 
 # Префикс hex-адресов ваших нод-компаньонов. Подсвечиваются зелёным в таблице.
 NODE_PREFIX = '10'
-# Префикс hex-адресов ваших ретрансляторов. Подсвечиваются голубым.
-#REPEATER_PREFIX = '33'
-REPEATER_PREFIX = '34'
+# Адреса ваших ретрансляторов (полные 3-байтные hex-адреса).
+# В path пакета адрес может приходить как первый байт (bph=1: '33'/'34'),
+# первые два (bph=2: '3333'/'3434') или полностью (bph=3: '333333'/'343434').
+# Подсвечиваются голубым в таблицах. Можно переопределить через --repeaters.
+MY_REPEATERS_HEX = ['333333', '343434']
 
-# Байт на хоп в маршруте (1 — текущие прошивки; 2 — режим Meshcore 1.14+).
+# Байт на хоп в маршруте (1 — старые прошивки; 2/3 — Meshcore 1.14+).
 # В логах Observer путь приходит как последовательность байт; адрес ретранслятора
-# может занимать 1, 2 или 3 байта. Для вашего репитера используется ключ
-# вида 33 33 33 ... (любая длина). В анализаторе хопы остаются побайтно, но
-# репитер определяется по префиксу REPEATER_PREFIX ИЛИ по маске (33)+.
+# занимает 1/2/3 байта в зависимости от прошивки. Принадлежность токена вашему
+# репитеру определяется через is_my_repeater() — сравнение префикса
+# соответствующей длины с каждым адресом из MY_REPEATERS_HEX.
 PATH_BYTES_PER_HOP = 1
 
 # Префиксы origin-нод в API MeshCoreTel, соответствующие вашему Observer/репитеру.
@@ -494,10 +524,16 @@ def _process_mqtt_payload(topic, payload_bytes):
                     path_norm.append(('0' + h).upper())
             if path_norm:
                 nb = None
-                if len(path_norm) >= 2 and is_repeater_token(path_norm[-1]):
-                    nb = path_norm[-2]
+                if len(path_norm) >= 2 and is_my_repeater(path_norm[-1]):
+                    cand = path_norm[-2]
+                    # Если предпоследний хоп — тоже наш репитер,
+                    # это пересылка между нашими нодами, не сосед.
+                    if not is_my_repeater(cand):
+                        nb = cand
                 elif path_norm:
-                    nb = path_norm[-1]
+                    cand = path_norm[-1]
+                    if not is_my_repeater(cand):
+                        nb = cand
                 if nb:
                     neighbor_stats[nb]['total'] += 1
                     # meshcoretomqtt шлёт "SNR"/"RSSI" с большой буквы
@@ -535,11 +571,11 @@ def _process_mqtt_payload(topic, payload_bytes):
             )
             if not is_trace:
                 last = path[-1]
-                if is_repeater_token(last) and len(path) >= 2:
+                if is_my_repeater(last) and len(path) >= 2:
                     nb = path[-2]
                 else:
                     nb = last
-                if nb:
+                if nb and not is_my_repeater(nb):
                     neighbor_stats[nb]['total'] += 1
                 hops = len(path)
                 bph = parsed.get('path_bytes_per_hop', 1)
@@ -873,8 +909,9 @@ def extract_outgoing_neighbors(text):
     Паттерн 2: Сообщения от PATHBOT_SENDER с маршрутом в формате "XX: Описание".
                Сообщения, начинающиеся с "..." — продолжения, игнорируются.
 
-    В обоих случаях: если первый хоп/префикс совпадает с REPEATER_PREFIX,
-    второй считается исходящим соседом.
+    В обоих случаях: если первый хоп/префикс — один из ваших репитеров
+    (см. MY_REPEATERS_HEX), второй считается исходящим соседом. Если второй
+    хоп тоже один из ваших репитеров (перекрёстная служебка), пропускаем.
 
     Args:
         text: расшифрованный текст сообщения
@@ -894,7 +931,8 @@ def extract_outgoing_neighbors(text):
             line = line.strip().replace(' ', '')
             if re_line.match(line):
                 hops = [h.strip().upper() for h in line.split(',')]
-                if len(hops) >= 2 and is_repeater_token(hops[0]):
+                if (len(hops) >= 2 and is_my_repeater(hops[0])
+                        and not is_my_repeater(hops[1])):
                     neighbors.append(hops[1])
             else:
                 break
@@ -911,20 +949,23 @@ def extract_outgoing_neighbors(text):
                 m = re.match(r'^(' + hex_prefix + r'):\s', line.strip())
                 if m:
                     prefixes.append(m.group(1).upper())
-            if len(prefixes) >= 2 and is_repeater_token(prefixes[0]):
+            if (len(prefixes) >= 2 and is_my_repeater(prefixes[0])
+                    and not is_my_repeater(prefixes[1])):
                 neighbors.append(prefixes[1])
 
     # Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX, YY,..." (2 или 4 hex на хоп для 1.14)
-    # Если путь начинается с REPEATER_PREFIX — берём второй хоп.
+    # Если путь начинается с одного из ваших репитеров — берём второй хоп
+    # (но только если он сам не один из ваших репитеров).
     # Если нет, но имя компаньона в MY_COMPANIONS — первый хоп (репитер
     # считается дублем, компаньон услышал соседа напрямую).
     m = re.search(r'(?:ack)?@\[(.*?)\]\s+([\da-fA-F]{2,4}(?:,\s*[\da-fA-F]{2,4})+)', text)
     if m:
         name = m.group(1)
         hops = [h.strip().upper() for h in m.group(2).split(',')]
-        if len(hops) >= 2 and is_repeater_token(hops[0]):
+        if (len(hops) >= 2 and is_my_repeater(hops[0])
+                and not is_my_repeater(hops[1])):
             neighbors.append(hops[1])
-        elif hops and name in MY_COMPANIONS:
+        elif hops and name in MY_COMPANIONS and not is_my_repeater(hops[0]):
             neighbors.append(hops[0])
 
     return neighbors
@@ -981,11 +1022,14 @@ def _process_parsed_raw(
     is_flood = parsed['route_type'] in (0x00, 0x01)
     if is_flood and parsed['path']:
         last = parsed['path'][-1]
-        if is_repeater_token(last):
+        if is_my_repeater(last):
+            # Last hop = наш репитер. Сосед — предпоследний, если он сам не наш
+            # репитер (пересылка между нашими нодами не учитывается).
             if len(parsed['path']) >= 2:
                 nb = parsed['path'][-2]
-                neighbor_stats[nb]['total'] += 1
-                _last_raw_neighbor = nb
+                if not is_my_repeater(nb):
+                    neighbor_stats[nb]['total'] += 1
+                    _last_raw_neighbor = nb
         else:
             neighbor_stats[last]['total'] += 1
             _last_raw_neighbor = last
@@ -994,19 +1038,22 @@ def _process_parsed_raw(
     if is_direct_trace:
         tr = parsed.get('trace_route') or []
         ts = parsed.get('trace_snr') or []
-        if len(tr) >= 3 and is_repeater_token(tr[0].upper()):
+        if len(tr) >= 3 and is_my_repeater(tr[0].upper()):
             nb = tr[1].upper()
-            if len(ts) == 0:
-                neighbor_stats[nb]['trace_attempts'] += 1
-            if len(ts) >= 2:
-                neighbor_stats[nb]['total'] += 1
-                neighbor_stats[nb]['trace_out_sum'] += ts[1]
-                neighbor_stats[nb]['trace_out_count'] += 1
-                outgoing_stats[nb]['total'] += 1
-            if len(ts) >= len(tr):
-                neighbor_stats[nb]['trace_ok'] += 1
-                neighbor_stats[nb]['trace_in_sum'] += ts[-1]
-                neighbor_stats[nb]['trace_in_count'] += 1
+            # Если второй хоп тоже наш репитер — это перекрёстная служебная
+            # пересылка между нашими нодами, не сосед.
+            if not is_my_repeater(nb):
+                if len(ts) == 0:
+                    neighbor_stats[nb]['trace_attempts'] += 1
+                if len(ts) >= 2:
+                    neighbor_stats[nb]['total'] += 1
+                    neighbor_stats[nb]['trace_out_sum'] += ts[1]
+                    neighbor_stats[nb]['trace_out_count'] += 1
+                    outgoing_stats[nb]['total'] += 1
+                if len(ts) >= len(tr):
+                    neighbor_stats[nb]['trace_ok'] += 1
+                    neighbor_stats[nb]['trace_in_sum'] += ts[-1]
+                    neighbor_stats[nb]['trace_in_count'] += 1
 
     if mqtt_attach_snr and mqtt_snr is not None and _last_raw_neighbor:
         try:
@@ -1319,7 +1366,7 @@ def print_stats(stats, cycle_info, debug, skip_cumulative=False):
 
     Цветовая раскраска:
       - Зелёный: узлы с префиксом NODE_PREFIX (ваши ноды)
-      - Голубой: узлы с префиксом REPEATER_PREFIX (ваши ретрансляторы)
+      - Голубой: ваши ретрансляторы (см. MY_REPEATERS_HEX)
       - Жёлтый + жирный: BROADCAST (широковещательные пакеты)
       - Без цвета: остальные узлы
 
@@ -1332,36 +1379,40 @@ def print_stats(stats, cycle_info, debug, skip_cumulative=False):
     print(f"ЦИКЛ {cycle_info['num']} (прочитано строк: {cycle_info['lines_read']})")
     print("=" * 70)
 
-    print("ДИАГНОСТИКА ПАРСИНГА (за этот цикл):")
-    print(f"   Всего обработано: {debug.get('total', 0)}")
-    print(f"   RX строк: {debug.get('rx_lines', 0)}")
-    print(f"   TX строк: {debug.get('tx_lines', 0)}")
-    print(f"   Broadcast RX: {debug.get('broadcast_rx', 0)}")
-    print(f"   Broadcast TX: {debug.get('broadcast_tx', 0)}")
-    print(f"   Игнорировано: {debug.get('ignored', 0)}")
-    print(f"   Malformed: {debug.get('malformed', 0)}")
-    print(f"   U RAW строк: {debug.get('raw_lines', 0)}")
-    print(f"   Исключения RX: {debug.get('exception', 0)}")
-    print(f"   Исключения TX: {debug.get('exception_tx', 0)}")
+    # В MQTT-only режиме весь блок диагностики USB-парсера всегда показывает
+    # нули (parse_line() не вызывается), поэтому скрываем его так же,
+    # как и накопительную таблицу.
+    if not skip_cumulative:
+        print("ДИАГНОСТИКА ПАРСИНГА (за этот цикл):")
+        print(f"   Всего обработано: {debug.get('total', 0)}")
+        print(f"   RX строк: {debug.get('rx_lines', 0)}")
+        print(f"   TX строк: {debug.get('tx_lines', 0)}")
+        print(f"   Broadcast RX: {debug.get('broadcast_rx', 0)}")
+        print(f"   Broadcast TX: {debug.get('broadcast_tx', 0)}")
+        print(f"   Игнорировано: {debug.get('ignored', 0)}")
+        print(f"   Malformed: {debug.get('malformed', 0)}")
+        print(f"   U RAW строк: {debug.get('raw_lines', 0)}")
+        print(f"   Исключения RX: {debug.get('exception', 0)}")
+        print(f"   Исключения TX: {debug.get('exception_tx', 0)}")
 
-    if debug.get('rx_samples'):
-        print(f"\nПримеры RX строк ({debug.get('rx_lines', 0)} всего):")
-        for i, s in enumerate(debug['rx_samples'], 1):
-            print(f"   {i}: {s}")
-
-    if debug.get('raw_lines'):
-        print(f"\nU RAW пакетов: {debug['raw_lines']}")
-        if debug.get('raw_samples'):
-            print("Примеры:")
-            for i, s in enumerate(debug['raw_samples'], 1):
+        if debug.get('rx_samples'):
+            print(f"\nПримеры RX строк ({debug.get('rx_lines', 0)} всего):")
+            for i, s in enumerate(debug['rx_samples'], 1):
                 print(f"   {i}: {s}")
 
-    if debug.get('ignored_samples'):
-        print(f"\nПримеры игнорированных строк:")
-        for i, s in enumerate(debug['ignored_samples'], 1):
-            print(f"   {i}: {repr(s)}")
+        if debug.get('raw_lines'):
+            print(f"\nU RAW пакетов: {debug['raw_lines']}")
+            if debug.get('raw_samples'):
+                print("Примеры:")
+                for i, s in enumerate(debug['raw_samples'], 1):
+                    print(f"   {i}: {s}")
 
-    print("-" * 70)
+        if debug.get('ignored_samples'):
+            print(f"\nПримеры игнорированных строк:")
+            for i, s in enumerate(debug['ignored_samples'], 1):
+                print(f"   {i}: {repr(s)}")
+
+        print("-" * 70)
 
     if skip_cumulative:
         num_nodes = len([n for n in stats if n != BROADCAST_NODE])
@@ -1397,7 +1448,7 @@ def print_stats(stats, cycle_info, debug, skip_cumulative=False):
         # Цветовая раскраска: ноды — зелёным, ретрансляторы — голубым, broadcast — жёлтым
         if node == BROADCAST_NODE:
             print(f"{YELLOW}{BOLD}{base_line}{RESET}")
-        elif is_repeater_token(node):
+        elif is_my_repeater(node):
             print(f"{CYAN}{base_line}{RESET}")
         elif node.startswith(NODE_PREFIX):
             print(f"{GREEN}{base_line}{RESET}")
@@ -1634,7 +1685,7 @@ def print_neighbors(cycle_info, debug=None):
             f"{snr_out:>7} {snr_in:>7} {trace_col:>7}"
         )
 
-        if is_repeater_token(node):
+        if is_my_repeater(node):
             print(f"{CYAN}{base_line}{RESET}")
         elif node.startswith(NODE_PREFIX):
             print(f"{GREEN}{base_line}{RESET}")
@@ -1650,8 +1701,9 @@ def print_outgoing_neighbors(cycle_info):
     """Выводит таблицу исходящих соседей — через кого уходят наши сообщения.
 
     Определяется из расшифрованных групповых сообщений, содержащих
-    "Found N unique path(s): XX,YY,ZZ,...". Если первый хоп совпадает
-    с REPEATER_PREFIX, то второй хоп — исходящий сосед.
+    "Found N unique path(s): XX,YY,ZZ,...". Если первый хоп — один из ваших
+    репитеров (MY_REPEATERS_HEX), второй хоп считается исходящим соседом
+    (если он сам не один из ваших репитеров — иначе пересылка пропускается).
 
     Args:
         cycle_info: dict с данными цикла
@@ -1675,7 +1727,7 @@ def print_outgoing_neighbors(cycle_info):
         pct = data['total'] / grand_total * 100 if grand_total > 0 else 0
         base_line = f"{node:<8} {data['total']:>8} {pct:>5.1f}%"
 
-        if node.upper().startswith(REPEATER_PREFIX.upper()):
+        if is_my_repeater(node):
             print(f"{CYAN}{base_line}{RESET}")
         elif node.upper().startswith(NODE_PREFIX.upper()):
             print(f"{GREEN}{base_line}{RESET}")
@@ -1687,11 +1739,13 @@ def print_outgoing_neighbors(cycle_info):
     print("=" * 70)
 
 
-def fetch_outgoing_from_api(repeater_prefix):
+def fetch_outgoing_from_api():
     """Получает пакеты из API MeshCoreTel и обновляет outgoing_stats.
 
-    Ищет пакеты, в path_hops которых встречается repeater_prefix.
-    Следующий хоп после repeater_prefix — исходящий сосед.
+    Ищет в path_hops любой токен, относящийся к вашим репитерам
+    (is_my_repeater). Следующий хоп после такого токена считается исходящим
+    соседом. Если следующий хоп — тоже один из ваших репитеров, это
+    перекрёстная пересылка между своими нодами, не сосед: пропускаем.
     Дедупликация по hash пакета (один пакет виден нескольким наблюдателям).
     Пагинация: забирает все новые пакеты с момента последнего запроса.
 
@@ -1699,7 +1753,6 @@ def fetch_outgoing_from_api(repeater_prefix):
         int: количество новых исходящих соседей, найденных в этом запросе
     """
     global _api_last_id
-    prefix_upper = repeater_prefix.upper()
     found = 0
     total_fetched = 0
     page_limit = 500
@@ -1758,11 +1811,15 @@ def fetch_outgoing_from_api(repeater_prefix):
                     f.write(f"[API] {origin}{my_tag}: {ptype} [{path_str}]\n")
 
             for i, hop in enumerate(hops):
-                if hop.upper() != prefix_upper:
+                if not is_my_repeater(hop):
                     continue
                 if i + 1 >= len(hops):
                     break
                 neighbor = hops[i + 1].upper()
+                if is_my_repeater(neighbor):
+                    # Перекрёстная пересылка между нашими репитерами —
+                    # не считаем соседом.
+                    break
                 outgoing_stats[neighbor]['total'] += 1
                 found += 1
                 path_str = ' → '.join(hops)
@@ -1785,15 +1842,16 @@ def fetch_outgoing_from_api(repeater_prefix):
     return found
 
 
-def _api_poller(repeater_prefix, stop_event):
+def _api_poller(stop_event):
     """Фоновый поток: периодически опрашивает API MeshCoreTel, пока не попросят остановиться.
 
     Работает независимо от состояния USB-порта: даже при потере Observer
     продолжает обновлять outgoing_stats через MeshCoreTel.
+    Адреса репитеров берутся из глобального MY_REPEATERS_HEX.
     """
     poll_interval = 15
     while not stop_event.is_set():
-        fetch_outgoing_from_api(repeater_prefix)
+        fetch_outgoing_from_api()
         # Спим интервал, но проверяем stop_event каждую секунду
         for _ in range(poll_interval):
             if stop_event.is_set():
@@ -1966,7 +2024,7 @@ def _connect_and_run(args, port, cycle_counter):
         else:
             print(f"{YELLOW}pycryptodome не установлен — расшифровка каналов отключена{RESET}")
         if args.api:
-            print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+            print(f"API meshcoretel.ru: исходящие соседи для адресов {','.join(MY_REPEATERS_HEX)}")
         if DEBUG_MODE:
             print(f"Отладка ->OBS: пакеты пишутся в {DEBUG_LOG}")
         print(flush=True)
@@ -2130,7 +2188,7 @@ def main(args):
         api_stop_event = threading.Event()
         api_thread = threading.Thread(
             target=_api_poller,
-            args=(args.repeater, api_stop_event),
+            args=(api_stop_event,),
             daemon=True,
         )
         api_thread.start()
@@ -2186,7 +2244,7 @@ def main(args):
         else:
             if args.api:
                 print("Режим только API (без USB).", flush=True)
-                print(f"API meshcoretel.ru: исходящие соседи для префикса {args.repeater}")
+                print(f"API meshcoretel.ru: исходящие соседи для адресов {','.join(MY_REPEATERS_HEX)}")
                 _stats_timer_loop("")
             elif args.mqtt and HAS_MQTT:
                 print("Режим только MQTT (без USB). Данные — из потока meshcore/.../packets|status.", flush=True)
@@ -2234,7 +2292,7 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Цвета в таблице статистики:\n"
                f"  {GREEN}Зелёный{RESET}        — ноды-компаньоны (префикс {NODE_PREFIX})\n"
-               f"  {CYAN}Голубой{RESET}        — ретрансляторы (префикс {REPEATER_PREFIX})\n"
+               f"  {CYAN}Голубой{RESET}        — ваши ретрансляторы ({','.join(MY_REPEATERS_HEX)})\n"
                f"  {YELLOW}{BOLD}Жёлтый жирный{RESET}  — широковещательные пакеты (BCAST)\n"
                "  Без цвета      — остальные узлы\n"
                "\nПеред запуском отключите веб-консоль (flasher.meshcore.dev) от серийного порта."
@@ -2254,12 +2312,14 @@ if __name__ == "__main__":
                              'Можно использовать вместе с --api.')
     parser.add_argument('--api', action='store_true',
                         help='Включить опрос API meshcoretel.ru '
-                             '(исходящие соседи для указанного префикса)')
+                             '(исходящие соседи для адресов из --repeaters)')
     parser.add_argument('-p', '--port', default=PORT,
                         help=f'Серийный порт Observer-ноды (по умолчанию {PORT})')
-    parser.add_argument('--repeater', default=REPEATER_PREFIX,
-                        help=f'Префикс ретранслятора для поиска через API '
-                             f'(по умолчанию {REPEATER_PREFIX})')
+    parser.add_argument('--repeaters', default=','.join(MY_REPEATERS_HEX),
+                        help=f'Адреса ваших репитеров через запятую (полные '
+                             f'3-байтные hex или префиксы), используются для '
+                             f'поиска соседей через API и подсветки в таблицах. '
+                             f'По умолчанию {",".join(MY_REPEATERS_HEX)}')
     parser.add_argument('--bots', action='store_true',
                         help='Определять исходящих соседей из ответов ботов в каналах '
                              '(требует отправки p/mt через meshcore-probe)')
@@ -2284,6 +2344,9 @@ if __name__ == "__main__":
     VERBOSE = args.verbose
     BOTS_MODE = args.bots
     DEBUG_MODE = args.debug
+    # Применяем CLI-список репитеров поверх дефолта в MY_REPEATERS_HEX.
+    if args.repeaters:
+        MY_REPEATERS_HEX = [r.strip().upper() for r in args.repeaters.split(',') if r.strip()]
     # Если ни один режим вывода не указан, показываем оригинальную статистику
     if not args.original and not args.neighbors and not args.hops:
         args.original = True
