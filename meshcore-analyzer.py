@@ -29,18 +29,24 @@ Changelog:
       не отрезает каждый хоп до последних 2 hex — теперь сохраняем исходную
       длину 2/4/6 hex, так что is_my_repeater отрабатывает корректно для
       2B/3B путей; bph для max_hops_by_bph определяется по длине первого хопа
-    - DIRECT TRACE: исправлена статистика по соседям. Три бага:
-      1) tr=[3434,3333,5A94,...] выкидывался целиком, потому что nb=tr[1]=3333
-         попадал под cross-mention skip. Теперь, как и в outgoing, идём
-         через всех своих в начале tr и берём первый «чужой» как соседа.
-      2) trace_out_sum использовал ts[1] вместо корректного ts[i-1] (где i —
-         длина пробега своих); для round-trip [3333,5A94,3333] это писало
-         в "SNR→" значение return-направления.
-      3) trace_ok / trace_in_sum фиксировались только при len(ts)>=len(tr),
-         что для round-trip из 3 хопов с 2 SNR никогда не срабатывало —
-         в таблице висело "0/N", хотя все трассы возвращались. Условие
-         поправлено на корректный round-trip-критерий: tr[-1] — наш,
-         len(ts) >= len(tr)-1.
+    - DIRECT TRACE: исправлена статистика по соседям. Корректная семантика
+      ts[k]: индекс k = SNR, добавленный tr[k] при приёме от tr[k-1], а
+      ts[0] = SNR при tr[0] от источника (источник не входит в tr).
+      Старая логика `nb = tr[1]; trace_out_sum += ts[1]; trace_in = ts[-1]`
+      была сразу несколькими ошибками для разных конфигураций:
+      1) Для tr=[3434,3333,5A94,...] nb=3333 (свой) выкидывался целиком —
+         5A94 не попадал в табличку. Теперь идём через всех своих в начале.
+      2) Для round-trip [3333,5A94,3333] ts[i] (а не ts[i-1] и не ts[1])
+         даёт правильный forward SNR→ nb. Было: писалось значение хопа
+         «источник → 3333» в колонку «SNR→ 5A94».
+      3) Возвратный SNR← (как наш репитер услышал ответ соседа) физически
+         НЕТ в parsed['trace_snr'] — это байт, который наш репитер сам
+         сейчас и добавит. Зато он есть в JSON-поле SNR MQTT-сообщения
+         (это его же собственный RX SNR на этом пакете). Берём именно
+         оттуда, когда tr[len(ts)] — наш, а tr[len(ts)-1] = nb.
+      4) Дедуп по trace_tag: наблюдатель видит один и тот же ответ
+         несколько раз (эхо/повтор), поэтому trace_attempts/out/ok теперь
+         инкрементируются один раз на уникальный tag.
     - extract_outgoing_neighbors: цепочка своих репитеров в начале пути больше
       не выкидывается целиком. Если путь идёт [343434, 333333, ABCD, ...] —
       пробегаем через всех своих подряд и берём ABCD как исходящего соседа,
@@ -428,6 +434,13 @@ outgoing_stats = defaultdict(lambda: {'total': 0})
 
 # Последний определённый сосед из RAW-пакета (для корреляции с SNR из RX-строки)
 _last_raw_neighbor = None
+
+# Множества trace_tag, по которым уже инкрементировали соответствующие
+# счётчики (наблюдатель часто видит один и тот же ответ несколько раз
+# из-за эхо/повторов). Ограничиваем размер, чтобы не утекать память.
+_trace_attempts_seen = set()
+_trace_out_seen = set()
+_trace_in_seen = set()
 
 # Рекорды максимального числа хопов отдельно по 1B/2B/3B.
 max_hops_by_bph = {1: None, 2: None, 3: None}
@@ -882,9 +895,14 @@ def parse_raw(hex_str):
         # маршрут — в payload после tag(4)+auth(4)+flags(1); flags&3 — log2 ширины хэша (1/2/4/8 B).
         trace_route = None
         trace_snr = None
+        trace_tag = None
         if payload_type == 0x09 and route_type in (0x02, 0x03):
             trace_snr = [(b - 256 if b > 127 else b) / 4.0 for b in raw_path]
             trace_route = []
+            if len(payload) >= 4:
+                # tag(4) — уникальный идентификатор трассы (для дедупа повторных
+                # наблюдений одного и того же ответа).
+                trace_tag = payload[0:4].hex().upper()
             if len(payload) > 9:
                 path_sz = payload[8] & 0x03
                 route_bph = 1 << path_sz
@@ -913,6 +931,7 @@ def parse_raw(hex_str):
             'dest': dest,
             'trace_route': trace_route,
             'trace_snr': trace_snr,
+            'trace_tag': trace_tag,
         }
     except (ValueError, IndexError):
         return None
@@ -1137,33 +1156,69 @@ def _process_parsed_raw(
     if is_direct_trace:
         tr = parsed.get('trace_route') or []
         ts = parsed.get('trace_snr') or []
-        # Соглашения про SNR-байты в TRACE: индекс k в ts — это SNR, который
-        # tr[k+1] зафиксировал, принимая пакет от tr[k] (т.е. источник tr[0]
-        # ничего не добавляет). Поэтому для нашего соседа nb=tr[i], где i —
-        # длина пробега наших репитеров в начале tr, ts[i-1] и есть «как
-        # сосед услышал нашу последнюю свою ноду» = SNR→ nb (forward).
-        # Для round-trip (tr[-1] — наш) ts[-1] — «как наш репитер услышал
-        # ответный сигнал» = SNR← nb (return). Длина полностью завершённого
-        # round-trip = len(tr)-1 SNR-байт.
+        tag = parsed.get('trace_tag')
+        # Соглашения по TRACE (см. Mesh::onRecvPacket). Каждый хоп tr[k] при
+        # приёме от ПРЕДЫДУЩЕГО передатчика добавляет в path байт SNR (×4).
+        #   ts[0] = SNR при tr[0] от ИСТОЧНИКА (источник не лежит в tr).
+        #   ts[k] = SNR при tr[k] от tr[k-1]  (k >= 1).
+        # Наблюдатель публикует пакет в MQTT в момент RX, ДО собственного
+        # append. Поэтому при наблюдении пакета:
+        #   - len(ts) = position k, на которой сейчас стоит наблюдатель
+        #     (он прочитал пакет; его собственный SNR появится после append);
+        #   - ИМЕННО mqtt_snr (поле SNR в JSON) = тот SNR, который наблюдатель
+        #     сейчас добавит, т.е. SNR от tr[k-1].
         if len(tr) >= 2 and is_my_repeater(tr[0].upper()):
+            # Пробег своих репитеров в начале (как в outgoing).
             i = 0
             while i < len(tr) and is_my_repeater(tr[i].upper()):
                 i += 1
             if 0 < i < len(tr):
                 nb = tr[i].upper()
-                if len(ts) == 0:
+
+                # Попытка трассы — увеличиваем при первом наблюдении уникального
+                # trace_tag (на любой стадии: start/середина/return).
+                if tag and tag not in _trace_attempts_seen:
                     neighbor_stats[nb]['trace_attempts'] += 1
-                if len(ts) >= i:
+                    _trace_attempts_seen.add(tag)
+
+                # SNR→ nb (forward): значение, которое сосед добавил, услышав
+                # последний из наших репитеров. На wire это ts[i].
+                # Дедуп по tag, чтобы не складывать многократные наблюдения
+                # одного и того же ответа.
+                if (len(ts) > i and tag
+                        and tag not in _trace_out_seen):
                     neighbor_stats[nb]['total'] += 1
-                    neighbor_stats[nb]['trace_out_sum'] += ts[i - 1]
+                    neighbor_stats[nb]['trace_out_sum'] += ts[i]
                     neighbor_stats[nb]['trace_out_count'] += 1
                     outgoing_stats[nb]['total'] += 1
-                if (is_my_repeater(tr[-1].upper())
-                        and len(ts) >= len(tr) - 1
-                        and len(ts) > i - 1):
-                    neighbor_stats[nb]['trace_ok'] += 1
-                    neighbor_stats[nb]['trace_in_sum'] += ts[-1]
-                    neighbor_stats[nb]['trace_in_count'] += 1
+                    _trace_out_seen.add(tag)
+
+                # SNR← nb (return): момент, когда наблюдатель только что принял
+                # пакет ОТ соседа nb (tr[len(ts)-1] = nb) и собирается append'ить.
+                # Это идентично условию: текущая позиция k = len(ts) — наша,
+                # а предыдущая позиция (k-1) — это nb. SNR берём из mqtt_snr
+                # (это и есть собственный RX SNR observer'а).
+                k = len(ts)
+                if (mqtt_attach_snr and mqtt_snr is not None
+                        and k >= 1 and k < len(tr)
+                        and is_my_repeater(tr[k].upper())
+                        and tr[k - 1].upper() == nb
+                        and tag and tag not in _trace_in_seen):
+                    try:
+                        s_back = float(mqtt_snr)
+                        neighbor_stats[nb]['trace_in_sum'] += s_back
+                        neighbor_stats[nb]['trace_in_count'] += 1
+                        neighbor_stats[nb]['trace_ok'] += 1
+                        _trace_in_seen.add(tag)
+                    except (TypeError, ValueError):
+                        pass
+
+                # Лёгкая защита от утечки памяти: если множества разрослись —
+                # сбрасываем (TRACE-теги уникальны и никогда не повторяются,
+                # старые забывать безопасно).
+                for _seen in (_trace_attempts_seen, _trace_out_seen, _trace_in_seen):
+                    if len(_seen) > 4096:
+                        _seen.clear()
 
     if mqtt_attach_snr and mqtt_snr is not None and _last_raw_neighbor:
         try:
