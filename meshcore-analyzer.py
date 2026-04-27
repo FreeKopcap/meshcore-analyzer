@@ -442,6 +442,12 @@ _trace_attempts_seen = set()
 _trace_out_seen = set()
 _trace_in_seen = set()
 
+# То же самое для GRP-сообщений: зашифрованный payload одинаков во всех
+# наблюдениях одного сообщения (меняется только path). Дедупим
+# outgoing_stats по хэшу payload, чтобы один ответ бота не считался
+# 5+ раз пока пакет ходит по флуду.
+_grp_outgoing_seen = set()
+
 # Рекорды максимального числа хопов отдельно по 1B/2B/3B.
 max_hops_by_bph = {1: None, 2: None, 3: None}
 
@@ -1131,9 +1137,20 @@ def _process_parsed_raw(
     if parsed['payload_type'] in (0x05, 0x06) and parsed['payload']:
         decrypted = decrypt_group_msg(parsed['payload'])
         if decrypted and BOTS_MODE:
-            outgoing_nbs = extract_outgoing_neighbors(decrypted['text'])
-            for out_nb in outgoing_nbs:
-                outgoing_stats[out_nb]['total'] += 1
+            extracted = extract_outgoing_neighbors(decrypted['text'])
+            # Дедуп по хэшу зашифрованного payload: одно и то же сообщение
+            # бота наблюдатель видит несколько раз (с разными путями), пока
+            # пакет ходит по флуду. Считаем outgoing_stats и подсвечиваем
+            # сообщение в verbose только в первом наблюдении.
+            if extracted:
+                payload_key = hashlib.sha256(parsed['payload']).digest()[:8]
+                if payload_key not in _grp_outgoing_seen:
+                    _grp_outgoing_seen.add(payload_key)
+                    if len(_grp_outgoing_seen) > 4096:
+                        _grp_outgoing_seen.clear()
+                    for out_nb in extracted:
+                        outgoing_stats[out_nb]['total'] += 1
+                    outgoing_nbs = extracted
 
     _last_raw_neighbor = None
     direct_to_obs = False
