@@ -22,8 +22,13 @@ Changelog:
       т.к. parse_line() для USB-лога не вызывается
     - extract_outgoing_neighbors: добавлен Паттерн 4 для ответа роботов вида
       "@[name] <текст> = XX,YY,..." (например, VAO Hekru: pong/discover).
-      Паттерн 3 расширен с 2/4 hex до 2/4/6 hex, чтобы поддерживать 3-байтные
-      хопы (Meshcore 1.14+ packed path)
+      Паттерны 1, 2, 3 расширены с 2/4 hex до 2/4/6 hex, чтобы поддерживать
+      1B/2B/3B-хопы (Meshcore 1.14+ packed path) и не зависеть больше от
+      устаревшего глобала PATH_BYTES_PER_HOP в этих regex
+    - MQTT path-only ветка (_process_mqtt_payload без поля 'raw'): больше
+      не отрезает каждый хоп до последних 2 hex — теперь сохраняем исходную
+      длину 2/4/6 hex, так что is_my_repeater отрабатывает корректно для
+      2B/3B путей; bph для max_hops_by_bph определяется по длине первого хопа
   v3.6 — Устойчивый MQTT-коннект, чище вывод в MQTT-only
     - Ретрай первичного connect() с видимым логом "попытка #N" (каждые 5с)
     - reconnect_delay_set(1..30s) для авто-реконнекта paho после установленной сессии
@@ -518,14 +523,16 @@ def _process_mqtt_payload(topic, payload_bytes):
             path = [x.strip().upper() for x in re.split(r'\s*->\s*|\s*,\s*', path) if x.strip()]
         if path and isinstance(path, (list, tuple)):
             hops = [str(h).strip().upper() for h in path]
-            # Нормализуем до 2 hex-символов на хоп (берём последние 2 если длиннее)
+            # Чистим всё, что не hex; оставляем длину как есть (2/4/6 hex = 1B/2B/3B
+            # на хоп). is_my_repeater() умеет матчить любую из этих длин.
             path_norm = []
             for h in hops:
-                h = re.sub(r'[^0-9A-Fa-f]', '', h)
-                if len(h) >= 2:
-                    path_norm.append(h[-2:].upper())
-                elif len(h) == 1:
-                    path_norm.append(('0' + h).upper())
+                h = re.sub(r'[^0-9A-Fa-f]', '', h).upper()
+                if not h:
+                    continue
+                if len(h) == 1:
+                    h = '0' + h   # 1 hex symbol → дополняем до байта
+                path_norm.append(h)
             if path_norm:
                 nb = None
                 if len(path_norm) >= 2 and is_my_repeater(path_norm[-1]):
@@ -549,13 +556,17 @@ def _process_mqtt_payload(topic, payload_bytes):
                             neighbor_stats[nb]['snr_count'] += 1
                         except (TypeError, ValueError):
                             pass
-                rec = max_hops_by_bph.get(1)
+                # Определяем bph по длине первого хопа (внутри одного пути
+                # длина хопов одинаковая). 2 hex = 1B, 4 hex = 2B, 6 hex = 3B.
+                first_len = len(path_norm[0])
+                bph = 1 if first_len == 2 else (2 if first_len == 4 else (3 if first_len == 6 else 1))
+                rec = max_hops_by_bph.get(bph)
                 if rec is None or len(path_norm) > rec.get('hops', 0):
-                    max_hops_by_bph[1] = {
+                    max_hops_by_bph[bph] = {
                         'time': time.strftime('%H:%M:%S - %d/%m/%Y'),
                         'hops': len(path_norm),
                         'path': path_norm,
-                        'path_bytes_per_hop': 1,
+                        'path_bytes_per_hop': bph,
                         'route_name': 'MQTT',
                         'payload_name': data.get('type', ''),
                         'payload_type': -1,
@@ -932,10 +943,9 @@ def extract_outgoing_neighbors(text):
     """
     neighbors = []
 
-    # Паттерн 1: "Found N unique path(s):" + строки "XX,YY,..." или "XXXX,YYYY,..." (1.14)
-    # Один хоп = 2 hex (1 байт) или 4 hex (2 байта)
-    hop_hex = r'[\da-fA-F]{2}' if PATH_BYTES_PER_HOP == 1 else r'[\da-fA-F]{4}'
-    re_line = re.compile(r'^' + hop_hex + r'(,' + hop_hex + r')+$')
+    # Паттерн 1: "Found N unique path(s):" + строки "XX,YY,..." (2/4/6 hex на хоп
+    # для 1B/2B/3B путей, MeshCore 1.14+).
+    re_line = re.compile(r'^[\da-fA-F]{2,6}(,[\da-fA-F]{2,6})+$')
     parts = re.split(r'Found \d+ unique path\(s\):\s*', text)
     for part in parts[1:]:
         for line in part.split('\n'):
@@ -948,8 +958,9 @@ def extract_outgoing_neighbors(text):
             else:
                 break
 
-    # Паттерн 2: сообщения от PATHBOT_SENDER "XX: Описание" или "XXXX: Описание" (1.14)
-    hex_prefix = r'[0-9a-fA-F]{2}' if PATH_BYTES_PER_HOP == 1 else r'[0-9a-fA-F]{4}'
+    # Паттерн 2: сообщения от PATHBOT_SENDER "XX: Описание" / "XXXX: ..." / "XXXXXX: ..."
+    # (2/4/6 hex на хоп для 1B/2B/3B).
+    hex_prefix = r'[0-9a-fA-F]{2,6}'
     sender_prefix = PATHBOT_SENDER + ': '
     if text.startswith(sender_prefix):
         msg = text[len(sender_prefix):]
