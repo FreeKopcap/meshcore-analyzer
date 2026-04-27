@@ -29,6 +29,12 @@ Changelog:
       не отрезает каждый хоп до последних 2 hex — теперь сохраняем исходную
       длину 2/4/6 hex, так что is_my_repeater отрабатывает корректно для
       2B/3B путей; bph для max_hops_by_bph определяется по длине первого хопа
+    - extract_outgoing_neighbors: цепочка своих репитеров в начале пути больше
+      не выкидывается целиком. Если путь идёт [343434, 333333, ABCD, ...] —
+      пробегаем через всех своих подряд и берём ABCD как исходящего соседа,
+      а не считаем такой пакет служебным cross-mention. Реализовано через
+      helper-функцию _outgoing_neighbor_from_path() — единая логика для всех
+      4 паттернов
     - extract_outgoing_neighbors больше не зависит от имён ботов и адресатов:
       константы PATHBOT_SENDER='AetherByte🤖' и MY_COMPANIONS=['Kopcap V4️⃣',...]
       удалены. Паттерн 2 срезает любой префикс "Имя_отправителя: " и ловит
@@ -183,6 +189,31 @@ def is_my_repeater(token: str) -> bool:
     if n in (2, 4, 6):
         return any(rep[:n] == t for rep in MY_REPEATERS_HEX)
     return any(rep.startswith(t) or t.startswith(rep) for rep in MY_REPEATERS_HEX)
+
+
+def _outgoing_neighbor_from_path(hops):
+    """Возвращает первый «чужой» хоп после пробега ваших репитеров в начале пути.
+
+    Если путь начинается с ваших репитеров (один или несколько подряд —
+    например, пакет прошёл цепочкой 343434 → 333333 → ... ), исходящим
+    соседом считается первый хоп ПОСЛЕ всего пробега своих, а не сразу
+    второй хоп. Это обрабатывает перекрёстные пересылки между своими
+    нодами без выбрасывания всего пакета.
+
+    Примеры (MY_REPEATERS_HEX = ['333333', '343434']):
+      [3434, ABCD]                     → ABCD
+      [3434, 3333, ABCD]               → ABCD   (пробег через двух своих)
+      [3434, 3333, 343434, AB, CD]     → AB     (любая комбинация своих)
+      [ABCD, ...]                      → None   (путь не с нашего репитера)
+      [3434]                           → None   (после пробега ничего нет)
+      [3434, 3333]                     → None   (весь путь — наши)
+    """
+    if not hops or not is_my_repeater(hops[0]):
+        return None
+    i = 0
+    while i < len(hops) and is_my_repeater(hops[i]):
+        i += 1
+    return hops[i] if i < len(hops) else None
 
 
 # Наборы hash-пакетов для сравнения USB vs API.
@@ -932,11 +963,14 @@ def extract_outgoing_neighbors(text):
                текст и знак '='. Например, ответ от робота VAO Hekru:
                "@[Kopcap V4️⃣] pong [2b 13h] = 3434,C980,5086,..."
 
-    Во всех случаях хопы — 2/4/6 hex (1B/2B/3B per hop). Если первый хоп —
-    один из ваших репитеров (см. MY_REPEATERS_HEX), второй считается исходящим
-    соседом. Если второй хоп тоже один из ваших репитеров (перекрёстная
-    служебка), пропускаем. Имена ботов и адресатов в Паттернах 2/3/4 не
-    важны: критерий принадлежности — только префикс пути.
+    Во всех случаях хопы — 2/4/6 hex (1B/2B/3B per hop). Алгоритм один:
+    путь начинается с одного из ваших репитеров (MY_REPEATERS_HEX), пробегаем
+    через всех ваших подряд и берём первый «чужой» хоп после них как
+    исходящего соседа (см. _outgoing_neighbor_from_path). Это корректно
+    работает и для пакетов вида [3434, ABCD] (один свой репитер), и для
+    [3434, 3333, ABCD] (пакет ушёл через двух своих, выходит наружу через
+    ABCD). Имена ботов и адресатов в Паттернах 2/3/4 не важны: критерий —
+    только префикс пути.
 
     Args:
         text: расшифрованный текст сообщения
@@ -955,9 +989,9 @@ def extract_outgoing_neighbors(text):
             line = line.strip().replace(' ', '')
             if re_line.match(line):
                 hops = [h.strip().upper() for h in line.split(',')]
-                if (len(hops) >= 2 and is_my_repeater(hops[0])
-                        and not is_my_repeater(hops[1])):
-                    neighbors.append(hops[1])
+                nb = _outgoing_neighbor_from_path(hops)
+                if nb:
+                    neighbors.append(nb)
             else:
                 break
 
@@ -991,37 +1025,35 @@ def extract_outgoing_neighbors(text):
                 prefixes.append(m.group(1).upper())
             elif prefixes:
                 break   # первый non-prefix non-empty после старта — стоп
-        if (len(prefixes) >= 2 and is_my_repeater(prefixes[0])
-                and not is_my_repeater(prefixes[1])):
-            neighbors.append(prefixes[1])
+        nb = _outgoing_neighbor_from_path(prefixes)
+        if nb:
+            neighbors.append(nb)
 
     # Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX,YY,..." сразу после имени.
-    # Хопы 2/4/6 hex (1B/2B/3B per hop, MeshCore 1.14+).
-    # Принимаем ответ ЛЮБОМУ адресату (имя не важно). Критерий — путь
-    # начинается с одного из ваших репитеров и второй хоп НЕ ваш репитер.
+    # Хопы 2/4/6 hex (1B/2B/3B per hop). Принимаем ответ ЛЮБОМУ адресату.
     m = re.search(
         r'(?:ack)?@\[[^\]]*\]\s+([\da-fA-F]{2,6}(?:,\s*[\da-fA-F]{2,6})+)',
         text,
     )
     if m:
         hops = [h.strip().upper() for h in m.group(1).split(',')]
-        if (len(hops) >= 2 and is_my_repeater(hops[0])
-                and not is_my_repeater(hops[1])):
-            neighbors.append(hops[1])
+        nb = _outgoing_neighbor_from_path(hops)
+        if nb:
+            neighbors.append(nb)
 
     # Паттерн 4: ответ робота с произвольным текстом и '=' перед путём:
     #   "@[name] pong [2b 13h] = XX,YY,..."
     #   "@[name] <любой текст без '=' и переноса> = XX,YY,..."
-    # Имя адресата не важно — то же требование к пути, что в Паттерне 3.
+    # Имя адресата не важно.
     m = re.search(
         r'@\[[^\]]*\][^\n=]*=\s*([\da-fA-F]{2,6}(?:,\s*[\da-fA-F]{2,6})+)',
         text,
     )
     if m:
         hops = [h.strip().upper() for h in m.group(1).split(',')]
-        if (len(hops) >= 2 and is_my_repeater(hops[0])
-                and not is_my_repeater(hops[1])):
-            neighbors.append(hops[1])
+        nb = _outgoing_neighbor_from_path(hops)
+        if nb:
+            neighbors.append(nb)
 
     return neighbors
 
