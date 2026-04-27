@@ -1252,7 +1252,15 @@ def _process_parsed_raw(
                     mode_tag = f" {MAGENTA}{BOLD}[3B]{RESET}"
                 elif tok_len == 8:
                     mode_tag = f" {CYAN}{BOLD}[4B]{RESET}"
-            print(f"{CYAN}    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]{mode_tag}{RESET}", flush=True)
+            # rxSNR — собственный RX SNR observer'а из JSON; именно он идёт
+            # в SNR← когда условие round-trip выполняется.
+            rx_tag = ""
+            if mqtt_attach_snr and mqtt_snr is not None:
+                try:
+                    rx_tag = f" rxSNR={float(mqtt_snr):.2f}"
+                except (TypeError, ValueError):
+                    pass
+            print(f"{CYAN}    -> {pkt_label} | route=[{route_str}] SNR=[{snr_str}]{rx_tag}{mode_tag}{RESET}", flush=True)
         else:
             bph = parsed.get('path_bytes_per_hop', 1)
             mode_tag = ""
