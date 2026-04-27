@@ -1,8 +1,51 @@
 """Meshcore Analyzer — анализатор пакетов MeshCore Observer.
 
-Version: 3.7
+Version: 3.8
 
 Changelog:
+  v3.8 — Исходящие соседи из path любого FLOOD-пакета (не только ботов)
+    - Добавлен path-based анализ исходящих соседей: для любого FLOOD,
+      в пути которого встречается мой репитер на ЛЮБОЙ позиции (originator,
+      transit, последний), первый чужой хоп после run-а своих засчитывается
+      как outgoing neighbor. Работает на ВСЕХ payload-типах (GRP_TXT,
+      GRP_DATA, ADV, ACK, DM…), не зависит от --bots и от расшифровки
+      контента. Транзитный кейс: пакет от чужого узла прошёл через 5086
+      (соседский репитер) → мой репитер → дальше; первый чужой после моего
+      = реальный сосед моего репитера, через которого ушёл этот пакет
+    - Helper _outgoing_neighbor_from_path (singular, требовал mine на path[0])
+      переписан в _outgoing_neighbors_from_path (plural). Просматривает path
+      целиком, на каждом run-е своих добавляет первый чужой хоп после run-а
+      в результат. Возвращает список (один путь может содержать несколько
+      раздельных run-ов своих → несколько разных соседей)
+    - 1B-пути (токены 2 hex) учитываются только частично: засчитываем сосед,
+      если мой репитер стоит в ВЕДУЩЕМ run-е (path[0] или подряд от path[0]).
+      Транзитные совпадения первого байта моих репитеров (для нынешних
+      MY_REPEATERS_HEX = ['333333','343434'] это «33» и «34», но логика
+      работает для любого набора через is_my_repeater) в середине 1B-пути
+      игнорируются: у чужих узлов вида XXyyyy с тем же первым байтом, что
+      и у любого моего, ложных срабатываний в середине пути слишком много.
+      Случаю «path[0] = чужой XXyyyy, совпадает с первым байтом моего» мы
+      можем ошибочно приписать соседа, но это маловероятно (обычно path[0]
+      = первый ретранслятор пакета от моего companion, т.е. реально мой
+      репитер). Для 2B/3B (4-6 hex) коллизии пренебрежимы, сканируем весь путь
+    - Дедуп: пара (sha256(payload)[:8], neighbor_hex) через единый helper
+      _record_outgoing. Один логический пакет наблюдатель видит многократно
+      с разными path; ОДИН и тот же сосед в разных наблюдениях считается
+      +1 один раз. Но один пакет, наблюдённый через РАЗНЫХ соседей
+      (path=[33,5A94,…] и path=[33,5086,…]), даёт +1 каждому — это разные
+      пути флуда, оба соседа реальны. Бот-extraction и path-extraction
+      используют общее множество _outgoing_seen, поэтому если паттерн и
+      path указывают на одного соседа в одном пакете — посчитается один раз
+    - Старое множество _grp_outgoing_seen (ключ: только payload_hash) удалено
+      как менее точное
+    - Verbose: под пакетом теперь печатаются раздельные аннотации-источник,
+      по одной на каждый канал детекта:
+        ^^^ бот: исходящий сосед: ...     — из расшифровки текста (--bots)
+        ^^^ путь: исходящий сосед: ...    — из path пакета (любой FLOOD)
+        ^^^ trace: исходящий сосед: ...   — из DIRECT TRACE (route+SNR анализ)
+      Раньше показывалась только бот-ветка; путь и trace учитывались в
+      статистике молча. Можно сразу глазами проверить, не ошиблись ли
+      в определении соседа
   v3.7 — Несколько ваших репитеров (3-байтные адреса), без перекрёстных соседей
     - MY_REPEATERS_HEX: список 3-байтных адресов ваших репитеров
       (по умолчанию ['333333','343434']) вместо одной 1-байтной константы
@@ -51,7 +94,7 @@ Changelog:
       не выкидывается целиком. Если путь идёт [343434, 333333, ABCD, ...] —
       пробегаем через всех своих подряд и берём ABCD как исходящего соседа,
       а не считаем такой пакет служебным cross-mention. Реализовано через
-      helper-функцию _outgoing_neighbor_from_path() — единая логика для всех
+      helper-функцию _outgoing_neighbors_from_path() — единая логика для всех
       4 паттернов
     - extract_outgoing_neighbors больше не зависит от имён ботов и адресатов:
       константы PATHBOT_SENDER='AetherByte🤖' и MY_COMPANIONS=['Kopcap V4️⃣',...]
@@ -209,29 +252,89 @@ def is_my_repeater(token: str) -> bool:
     return any(rep.startswith(t) or t.startswith(rep) for rep in MY_REPEATERS_HEX)
 
 
-def _outgoing_neighbor_from_path(hops):
-    """Возвращает первый «чужой» хоп после пробега ваших репитеров в начале пути.
+def _outgoing_neighbors_from_path(hops):
+    """Возвращает список «чужих» соседей, идущих сразу после ваших репитеров в пути.
 
-    Если путь начинается с ваших репитеров (один или несколько подряд —
-    например, пакет прошёл цепочкой 343434 → 333333 → ... ), исходящим
-    соседом считается первый хоп ПОСЛЕ всего пробега своих, а не сразу
-    второй хоп. Это обрабатывает перекрёстные пересылки между своими
-    нодами без выбрасывания всего пакета.
+    Логика зависит от длины токенов в пути (1B / 2B / 3B per hop):
+
+    **2B/3B-пути** (токены 4 или 6 hex). Просматривается весь path. На каждом
+    run-е подряд идущих ваших репитеров берётся первый чужой хоп после run-а
+    и добавляется в результат. Если в одном пути несколько раздельных run-ов
+    наших нод (например, одна нода в начале и другая в середине транзитом),
+    выпишутся все соответствующие соседи. Коллизия первых 4-6 hex с чужими
+    узлами пренебрежимо мала, поэтому транзитные совпадения считаем достоверными.
+
+    **1B-пути** (токены 2 hex). Учитываем ТОЛЬКО ведущий run наших репитеров:
+    если path[0] (или подряд идущие path[0..k]) — мой, берём path[k+1] как
+    соседа. Транзитные совпадения первого байта моих репитеров в середине
+    пути игнорируем — у чужих узлов с тем же первым байтом, что у одного
+    из моих, is_my_repeater даёт ложные срабатывания, и плотность таких
+    «двойников» в середине рандомного пути слишком велика. Для ведущего
+    хопа такая ситуация тоже возможна (чужой XXyyyy с XX = первый байт
+    одного из MY_REPEATERS_HEX выступил первым ретранслятором), но
+    вероятность мала: обычно path[0] совпадает с моим собственным
+    репитером (мой companion отправил, мой репитер ретранслировал первым),
+    либо это пакет, прошедший коротким путём через нашу зону. Эту
+    небольшую погрешность принимаем сознательно ради покрытия 1B-пакетов.
+    Никаких хардкодных байт в коде нет — список репитеров берётся
+    из MY_REPEATERS_HEX, helper работает для любого их набора.
+
+    Применимо к любому FLOOD-пакету, прошедшему через ваш репитер на любой
+    позиции — originator (свой = path[0]), transit (свой в середине, только
+    в 2B/3B) или конец (свой = path[-1] = пред-наблюдатель). В последнем
+    случае после своего ничего нет, ничего и не возвращается.
 
     Примеры (MY_REPEATERS_HEX = ['333333', '343434']):
-      [3434, ABCD]                     → ABCD
-      [3434, 3333, ABCD]               → ABCD   (пробег через двух своих)
-      [3434, 3333, 343434, AB, CD]     → AB     (любая комбинация своих)
-      [ABCD, ...]                      → None   (путь не с нашего репитера)
-      [3434]                           → None   (после пробега ничего нет)
-      [3434, 3333]                     → None   (весь путь — наши)
+
+    2B/3B path:
+      [3434, ABCD]                     → ['ABCD']
+      [3434, 3333, ABCD]               → ['ABCD']            (run длины 2)
+      [3434, ABCD, 3333, EFGH]         → ['ABCD', 'EFGH']    (два run-а свои)
+      [ABCD, 3434, EFGH]               → ['EFGH']            (свой в середине)
+      [ABCD, EFGH]                     → []                  (наших в пути нет)
+      [3434]                           → []                  (после run-а пусто)
+      [3434, 3333]                     → []                  (весь путь — наши)
+
+    1B path (только ведущий run):
+      [34, AB]                         → ['AB']              (path[0] мой)
+      [34, 33, AB]                     → ['AB']              (run длины 2)
+      [AB, 34, CD]                     → []                  (свой в середине → skip)
+      [AB, CD]                         → []                  (наших нет)
+      [34]                             → []                  (после run-а пусто)
     """
-    if not hops or not is_my_repeater(hops[0]):
-        return None
+    if not hops:
+        return []
+    out = []
+    seen = set()
+    is_1b = len(hops[0]) <= 2
+
+    if is_1b:
+        # Только ведущий run. Транзитные совпадения в середине ненадёжны.
+        if not is_my_repeater(hops[0]):
+            return []
+        i = 0
+        while i < len(hops) and is_my_repeater(hops[i]):
+            i += 1
+        if i < len(hops):
+            out.append(hops[i])
+        return out
+
+    # 2B/3B: сканируем весь path, фиксируем все my→чужой переходы.
     i = 0
-    while i < len(hops) and is_my_repeater(hops[i]):
-        i += 1
-    return hops[i] if i < len(hops) else None
+    while i < len(hops):
+        if is_my_repeater(hops[i]):
+            j = i
+            while j < len(hops) and is_my_repeater(hops[j]):
+                j += 1
+            if j < len(hops):
+                nb = hops[j]
+                if nb not in seen:
+                    seen.add(nb)
+                    out.append(nb)
+            i = j + 1
+        else:
+            i += 1
+    return out
 
 
 # Наборы hash-пакетов для сравнения USB vs API.
@@ -442,11 +545,31 @@ _trace_attempts_seen = set()
 _trace_out_seen = set()
 _trace_in_seen = set()
 
-# То же самое для GRP-сообщений: зашифрованный payload одинаков во всех
-# наблюдениях одного сообщения (меняется только path). Дедупим
-# outgoing_stats по хэшу payload, чтобы один ответ бота не считался
-# 5+ раз пока пакет ходит по флуду.
-_grp_outgoing_seen = set()
+# Дедуп исходящих соседей: ключ = (sha256(payload)[:8], neighbor_hex).
+# Один логический пакет наблюдатель видит несколько раз с разными path —
+# нужно засчитать одного и того же соседа только один раз. Однако ОДИН
+# пакет, наблюдённый через двух разных соседей (path=[3333,5A94,...] и
+# path=[3333,5086,...]), даёт +1 каждому — это разные пути распространения.
+# Используется и для bot-text extraction, и для path-based extraction
+# (см. _record_outgoing).
+_outgoing_seen = set()
+
+
+def _record_outgoing(payload_hash: bytes, neighbor: str) -> bool:
+    """Регистрирует наблюдение пары (payload, neighbor) в outgoing_stats.
+
+    Возвращает True при первом наблюдении пары (и инкрементирует статистику),
+    False — если эту пару уже видели (счётчик не трогаем). Лёгкая защита
+    от утечки памяти: при росте >4096 сбрасываем множество.
+    """
+    key = (payload_hash, neighbor)
+    if key in _outgoing_seen:
+        return False
+    _outgoing_seen.add(key)
+    if len(_outgoing_seen) > 4096:
+        _outgoing_seen.clear()
+    outgoing_stats[neighbor]['total'] += 1
+    return True
 
 # Рекорды максимального числа хопов отдельно по 1B/2B/3B.
 max_hops_by_bph = {1: None, 2: None, 3: None}
@@ -1003,7 +1126,7 @@ def extract_outgoing_neighbors(text):
     Во всех случаях хопы — 2/4/6 hex (1B/2B/3B per hop). Алгоритм один:
     путь начинается с одного из ваших репитеров (MY_REPEATERS_HEX), пробегаем
     через всех ваших подряд и берём первый «чужой» хоп после них как
-    исходящего соседа (см. _outgoing_neighbor_from_path). Это корректно
+    исходящего соседа (см. _outgoing_neighbors_from_path). Это корректно
     работает и для пакетов вида [3434, ABCD] (один свой репитер), и для
     [3434, 3333, ABCD] (пакет ушёл через двух своих, выходит наружу через
     ABCD). Имена ботов и адресатов в Паттернах 2/3/4 не важны: критерий —
@@ -1026,9 +1149,7 @@ def extract_outgoing_neighbors(text):
             line = line.strip().replace(' ', '')
             if re_line.match(line):
                 hops = [h.strip().upper() for h in line.split(',')]
-                nb = _outgoing_neighbor_from_path(hops)
-                if nb:
-                    neighbors.append(nb)
+                neighbors.extend(_outgoing_neighbors_from_path(hops))
             else:
                 break
 
@@ -1062,9 +1183,7 @@ def extract_outgoing_neighbors(text):
                 prefixes.append(m.group(1).upper())
             elif prefixes:
                 break   # первый non-prefix non-empty после старта — стоп
-        nb = _outgoing_neighbor_from_path(prefixes)
-        if nb:
-            neighbors.append(nb)
+        neighbors.extend(_outgoing_neighbors_from_path(prefixes))
 
     # Паттерн 3: "ack@[имя] XX,YY,..." или "@[имя] XX,YY,..." сразу после имени.
     # Хопы 2/4/6 hex (1B/2B/3B per hop). Принимаем ответ ЛЮБОМУ адресату.
@@ -1074,9 +1193,7 @@ def extract_outgoing_neighbors(text):
     )
     if m:
         hops = [h.strip().upper() for h in m.group(1).split(',')]
-        nb = _outgoing_neighbor_from_path(hops)
-        if nb:
-            neighbors.append(nb)
+        neighbors.extend(_outgoing_neighbors_from_path(hops))
 
     # Паттерн 4: ответ робота с произвольным текстом и '=' перед путём:
     #   "@[name] pong [2b 13h] = XX,YY,..."
@@ -1088,9 +1205,7 @@ def extract_outgoing_neighbors(text):
     )
     if m:
         hops = [h.strip().upper() for h in m.group(1).split(',')]
-        nb = _outgoing_neighbor_from_path(hops)
-        if nb:
-            neighbors.append(nb)
+        neighbors.extend(_outgoing_neighbors_from_path(hops))
 
     return neighbors
 
@@ -1133,24 +1248,20 @@ def _process_parsed_raw(
         })
 
     decrypted = None
-    outgoing_nbs = []
+    outgoing_nbs_bot = []
+    outgoing_nbs_path = []
+    outgoing_nbs_trace = []
     if parsed['payload_type'] in (0x05, 0x06) and parsed['payload']:
         decrypted = decrypt_group_msg(parsed['payload'])
         if decrypted and BOTS_MODE:
             extracted = extract_outgoing_neighbors(decrypted['text'])
-            # Дедуп по хэшу зашифрованного payload: одно и то же сообщение
-            # бота наблюдатель видит несколько раз (с разными путями), пока
-            # пакет ходит по флуду. Считаем outgoing_stats и подсвечиваем
-            # сообщение в verbose только в первом наблюдении.
+            # Дедуп через _record_outgoing: каждая пара (payload, neighbor)
+            # учитывается один раз. Подсвечиваем в verbose только тех соседей,
+            # которых увидели впервые в этом наблюдении.
             if extracted:
-                payload_key = hashlib.sha256(parsed['payload']).digest()[:8]
-                if payload_key not in _grp_outgoing_seen:
-                    _grp_outgoing_seen.add(payload_key)
-                    if len(_grp_outgoing_seen) > 4096:
-                        _grp_outgoing_seen.clear()
-                    for out_nb in extracted:
-                        outgoing_stats[out_nb]['total'] += 1
-                    outgoing_nbs = extracted
+                payload_hash = hashlib.sha256(parsed['payload']).digest()[:8]
+                outgoing_nbs_bot = [nb for nb in extracted
+                                    if _record_outgoing(payload_hash, nb)]
 
     _last_raw_neighbor = None
     direct_to_obs = False
@@ -1169,6 +1280,24 @@ def _process_parsed_raw(
             neighbor_stats[last]['total'] += 1
             _last_raw_neighbor = last
             direct_to_obs = True
+
+    # Path-based извлечение исходящих соседей: для любого FLOOD-пакета,
+    # в пути которого встречается мой репитер (на любой позиции), первый
+    # чужой хоп сразу после run-а своих — реальный сосед, принявший
+    # ретрансляцию от моего репитера. Подходит и для пакетов, отправленных
+    # моим узлом (свой = path[0]), и для транзитных (свой в середине пути,
+    # пришёл к нам с другого репитера, ушёл дальше). Один логический пакет
+    # наблюдатель видит многократно: пары (payload, neighbor) дедуплицируются
+    # через _record_outgoing, ОДИН пакет, увиденный через двух разных соседей,
+    # даёт +1 каждому, а повторное наблюдение того же соседа не накручивает.
+    if is_flood and parsed.get('payload'):
+        nbs_path = _outgoing_neighbors_from_path(parsed['path'])
+        if nbs_path:
+            payload_hash = hashlib.sha256(parsed['payload']).digest()[:8]
+            for nb in nbs_path:
+                if (_record_outgoing(payload_hash, nb)
+                        and nb not in outgoing_nbs_path):
+                    outgoing_nbs_path.append(nb)
 
     if is_direct_trace:
         tr = parsed.get('trace_route') or []
@@ -1209,6 +1338,7 @@ def _process_parsed_raw(
                     neighbor_stats[nb]['trace_out_count'] += 1
                     outgoing_stats[nb]['total'] += 1
                     _trace_out_seen.add(tag)
+                    outgoing_nbs_trace.append(nb)
 
                 # SNR← nb (return): момент, когда наблюдатель только что принял
                 # пакет ОТ соседа nb (tr[len(ts)-1] = nb) и собирается append'ить.
@@ -1247,7 +1377,7 @@ def _process_parsed_raw(
             pass
 
     if VERBOSE:
-        if outgoing_nbs:
+        if outgoing_nbs_bot or outgoing_nbs_path:
             color, end = f"{MAGENTA}{BOLD}", RESET
         elif direct_to_obs:
             color, end = f"{YELLOW}{BOLD}", RESET
@@ -1297,8 +1427,12 @@ def _process_parsed_raw(
                     print(f"{color}       {tl}{end}", flush=True)
             else:
                 print(f"{color}       {decrypted['channel']}: {text}{end}", flush=True)
-        if outgoing_nbs:
-            print(f"{MAGENTA}       ^^^ бот: исходящий сосед: {','.join(outgoing_nbs)}{RESET}", flush=True)
+        if outgoing_nbs_bot:
+            print(f"{MAGENTA}       ^^^ бот: исходящий сосед: {','.join(outgoing_nbs_bot)}{RESET}", flush=True)
+        if outgoing_nbs_path:
+            print(f"{MAGENTA}       ^^^ путь: исходящий сосед: {','.join(outgoing_nbs_path)}{RESET}", flush=True)
+        if outgoing_nbs_trace:
+            print(f"{MAGENTA}       ^^^ trace: исходящий сосед: {','.join(outgoing_nbs_trace)}{RESET}", flush=True)
 
     if DEBUG_MODE:
         dest_info = f" -> {parsed['dest']}" if parsed.get('dest') else ""
